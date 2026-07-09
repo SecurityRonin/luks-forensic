@@ -1,0 +1,18 @@
+[package]
+name         = "luks-forensic"
+description   = "LUKS metadata anomaly auditor — severity-graded findings over the cipher, KDF, and keyslot parameters of a LUKS container."
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+repository   = { workspace = true }
+readme       = "../README.md"
+keywords     = ["luks", "forensics", "dfir", "encryption", "cryptsetup"]
+categories   = ["cryptography", "filesystem"]
+
+[dependencies]
+luks = { workspace = true }
+
+[lints]
+workspace = true

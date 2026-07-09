@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = ["core", "forensic"]
+
+# ---------------------------------------------------------------------------
+# Shared package fields (DRY): bump version / MSRV / license here once;
+# members inherit via `field.workspace = true`.
+# ---------------------------------------------------------------------------
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.81"
+license      = "Apache-2.0"
+authors      = ["Albert Hui <albert@securityronin.com>"]
+repository   = "https://github.com/SecurityRonin/luks-forensic"
+
+# ---------------------------------------------------------------------------
+# Single source of truth for dependency versions shared by 2+ members.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+thiserror = "2"
+# Crypto — NEVER hand-rolled: audited RustCrypto crates for every primitive.
+aes    = "0.8"
+# XTS-AES sector mode (LUKS aes-xts-plain64). 0.5.x tracks cipher 0.4 / aes 0.8.
+xts-mode = "0.5"
+cbc    = "0.1"
+sha1   = "0.10"
+sha2   = "0.10"
+hmac   = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+argon2 = "0.5"
+forensicnomicon = { version = "1", features = ["std"] }
+luks = { version = "0.1", path = "core", package = "luks-core" }
+
+# ---------------------------------------------------------------------------
+# Paranoid Gatekeeper: these crates parse untrusted, attacker-controllable
+# LUKS containers. Never panic, never read out of bounds, never trust a length.
+# ---------------------------------------------------------------------------
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all                      = { level = "warn",  priority = -1 }
+pedantic                 = { level = "warn",  priority = -1 }
+correctness              = { level = "deny",  priority = -1 }
+suspicious               = { level = "deny",  priority = -1 }
+unwrap_used              = { level = "deny",  priority = 0  }
+expect_used              = { level = "deny",  priority = 0  }
+module_name_repetitions  = { level = "allow", priority = 1  }
+must_use_candidate       = { level = "allow", priority = 1  }
+missing_errors_doc       = { level = "allow", priority = 1  }
+missing_panics_doc       = { level = "allow", priority = 1  }
+cast_possible_truncation = { level = "allow", priority = 1  }
+cast_possible_wrap       = { level = "allow", priority = 1  }
+cast_sign_loss           = { level = "allow", priority = 1  }
+cast_precision_loss      = { level = "allow", priority = 1  }
+too_many_lines           = { level = "allow", priority = 1  }
+items_after_statements   = { level = "allow", priority = 1  }
+similar_names            = { level = "allow", priority = 1  }
+manual_let_else          = { level = "allow", priority = 1  }
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1

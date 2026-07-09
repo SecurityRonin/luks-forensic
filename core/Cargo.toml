@@ -1,0 +1,28 @@
+[package]
+name         = "luks-core"
+description   = "Pure-Rust LUKS1/LUKS2 reader and decryptor — parse the on-disk header, derive the master key, and decrypt the payload. Panic-free, no unsafe."
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+repository   = { workspace = true }
+readme       = "../README.md"
+keywords     = ["luks", "forensics", "dm-crypt", "encryption", "cryptsetup"]
+categories   = ["cryptography", "filesystem", "parser-implementations"]
+
+[lib]
+name = "luks"
+
+[dependencies]
+thiserror = { workspace = true }
+aes       = { workspace = true }
+xts-mode  = { workspace = true }
+sha1      = { workspace = true }
+sha2      = { workspace = true }
+hmac      = { workspace = true }
+pbkdf2    = { workspace = true }
+argon2    = { workspace = true }
+
+[lints]
+workspace = true
