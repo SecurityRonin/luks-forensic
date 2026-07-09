@@ -29,6 +29,9 @@ sha2   = "0.10"
 hmac   = "0.12"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 argon2 = "0.5"
+# LUKS2 metadata is JSON with base64-encoded salts/digests.
+serde_json = "1"
+base64 = "0.22"
 forensicnomicon = { version = "1", features = ["std"] }
 luks = { version = "0.1", path = "core", package = "luks-core" }
 

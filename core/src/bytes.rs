@@ -22,6 +22,16 @@ pub fn be_u32(data: &[u8], off: usize) -> u32 {
     u32::from_be_bytes(b)
 }
 
+/// Read a big-endian `u64` at `off`, or 0 if out of range.
+#[must_use]
+pub fn be_u64(data: &[u8], off: usize) -> u64 {
+    let mut b = [0u8; 8];
+    if let Some(s) = data.get(off..off + 8) {
+        b.copy_from_slice(s);
+    }
+    u64::from_be_bytes(b)
+}
+
 /// Read a fixed-size byte array at `off`, zero-filled if out of range.
 #[must_use]
 pub fn bytes_n<const N: usize>(data: &[u8], off: usize) -> [u8; N] {

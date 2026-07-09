@@ -27,8 +27,10 @@ mod bytes;
 mod crypto;
 mod error;
 mod header;
+mod header2;
 mod volume;
 
 pub use error::{LuksError, Result};
 pub use header::{Keyslot, Luks1Header};
-pub use volume::{DecryptedPayload, LuksVolume};
+pub use header2::{Luks2Digest, Luks2Header, Luks2Kdf, Luks2Keyslot, Luks2Segment};
+pub use volume::{DecryptedPayload, LuksVolume, VolumeInfo};

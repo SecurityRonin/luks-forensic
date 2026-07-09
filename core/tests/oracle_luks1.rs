@@ -33,9 +33,9 @@ fn tier2_luks1_xts256_matches_cryptsetup() {
     let file = File::open(&path).expect("open luks1.img");
     let mut vol = LuksVolume::unlock1_with_passphrase(file, PASSPHRASE).expect("unlock luks1.img");
 
-    assert_eq!(vol.header().cipher_name, "aes");
-    assert_eq!(vol.header().cipher_mode, "xts-plain64");
-    assert_eq!(vol.header().key_bytes, 64);
+    assert_eq!(vol.info().cipher_name, "aes");
+    assert_eq!(vol.info().cipher_mode, "xts-plain64");
+    assert_eq!(vol.info().key_bytes, 64);
 
     // (payload LBA, expected decrypted-sector SHA-256) — cryptsetup ground truth.
     let cases: [(u64, &str); 6] = [
