@@ -34,3 +34,9 @@ pub use error::{LuksError, Result};
 pub use header::{Keyslot, Luks1Header};
 pub use header2::{Luks2Digest, Luks2Header, Luks2Kdf, Luks2Keyslot, Luks2Segment};
 pub use volume::{DecryptedPayload, LuksVolume, VolumeInfo};
+
+/// Fuzz-only re-export (hidden from docs). Kept `pub` so the `core/fuzz` crate
+/// can drive the anti-forensic merge over arbitrary bytes directly, alongside
+/// the header parsers and the full unlock pipeline.
+#[doc(hidden)]
+pub use af::merge as af_merge;

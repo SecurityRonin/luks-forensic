@@ -1,0 +1,49 @@
+[package]
+name = "luks-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.luks]
+path = ".."
+package = "luks-core"
+
+# Prevent this from interfering with workspace members up the tree.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "luks1_header"
+path = "fuzz_targets/luks1_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "luks2_header"
+path = "fuzz_targets/luks2_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "af_merge"
+path = "fuzz_targets/af_merge.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unlock"
+path = "fuzz_targets/unlock.rs"
+test = false
+doc = false
+bench = false
