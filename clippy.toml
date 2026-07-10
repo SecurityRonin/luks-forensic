@@ -6,4 +6,4 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 
 # Product/format names that look like code identifiers to doc_markdown.
-doc-valid-idents = ["RustCrypto", "BitLocker", "BDE", "FVE", "FVEK", "VMK", "TWEAK", "GUID", "AES-CBC", "AES-CCM", "AES-XTS", "AES-ECB", "SHA-256", "UTF-16LE", "FILETIME", "libbde", "pybde", "dfvfs", "dislocker", "DFIR", "..", "TPM"]
+doc-valid-idents = ["RustCrypto", "LUKS", "LUKS1", "LUKS2", "cryptsetup", "dm-crypt", "PBKDF2", "KDF", "Argon2", "Argon2id", "AF", "XTS", "AES-XTS", "AES-ECB", "SHA-256", "aes-xts-plain64", "plain64", "phdr", "mk-digest", "GUID", "UUID", "DFIR", "..", "TPM"]
