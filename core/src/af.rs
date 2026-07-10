@@ -64,7 +64,7 @@ fn af_merge<D: Digest>(material: &[u8], block_size: usize, stripes: usize) -> Ve
     acc
 }
 
-/// Dispatch [`af_merge`] on the header `hash_spec` string.
+/// Dispatch `af_merge` on the header `hash_spec` string.
 ///
 /// # Errors
 /// [`LuksError::Unsupported`] for a hash spec with no RustCrypto implementation.
@@ -94,7 +94,7 @@ pub fn material_len(block_size: usize, stripes: usize) -> usize {
 }
 
 /// Split `master` into `stripes` blocks with deterministic `filler`, the inverse
-/// of [`af_merge`] — test-only, used to build synthetic keyslots and prove the
+/// of `af_merge` — test-only, used to build synthetic keyslots and prove the
 /// round-trip. Crate-internal so the volume unlock tests can reach it too.
 #[cfg(test)]
 pub(crate) fn af_split<D: Digest>(

@@ -93,7 +93,7 @@ pub struct Luks1Header {
 }
 
 impl Luks1Header {
-    /// Parse a LUKS1 header from the first [`LUKS1_PHDR_LEN`] bytes of `data`.
+    /// Parse a LUKS1 header from the first `LUKS1_PHDR_LEN` bytes of `data`.
     ///
     /// # Errors
     /// [`LuksError::NotLuks`] if the magic is absent, [`LuksError::UnsupportedVersion`]
