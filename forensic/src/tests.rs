@@ -47,3 +47,33 @@ fn low_iterations_is_medium() {
         .unwrap();
     assert_eq!(low.severity, Severity::Medium);
 }
+
+#[test]
+fn findings_carry_source_category_and_evidence() {
+    // A header triggering all four anomaly kinds → exercises every Observation arm.
+    let h = Luks1Header::parse(&header_bytes(b"cbc-essiv:sha256", b"sha1", 100)).unwrap();
+    let findings = audit1_findings(&h, "container.luks");
+    assert_eq!(findings.len(), 4);
+    for f in &findings {
+        assert_eq!(f.source.analyzer, "luks-forensic");
+        assert_eq!(f.source.scope, "container.luks");
+        assert!(f.source.version.is_some());
+    }
+    let inv = findings
+        .iter()
+        .find(|f| f.code == "LUKS-KEYSLOT-INVENTORY")
+        .unwrap();
+    assert_eq!(inv.category, Category::Provenance);
+    assert_eq!(inv.severity, Some(Severity::Info));
+    let weak = findings
+        .iter()
+        .find(|f| f.code == "LUKS-WEAK-CIPHER-MODE")
+        .unwrap();
+    assert_eq!(weak.category, Category::Integrity);
+    assert!(!weak.evidence.is_empty());
+    let low = findings
+        .iter()
+        .find(|f| f.code == "LUKS-LOW-KDF-ITERATIONS")
+        .unwrap();
+    assert_eq!(low.evidence.len(), 2);
+}

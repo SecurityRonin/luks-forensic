@@ -13,6 +13,7 @@ categories   = ["cryptography", "filesystem"]
 
 [dependencies]
 luks = { workspace = true }
+forensicnomicon = { workspace = true }
 
 [lints]
 workspace = true
