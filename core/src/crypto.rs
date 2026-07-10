@@ -235,6 +235,58 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn xts_area_roundtrip_128bit_key() {
+        // 32-byte key => AES-128-XTS branch (two 16-byte sub-keys).
+        let key = [0x91u8; 32];
+        let mut buf = vec![0u8; 512];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(1);
+        }
+        let plain = buf.clone();
+        let (k1, k2) = key.split_at(16);
+        let xts = Xts128::<Aes128>::new(Aes128::new(k1.into()), Aes128::new(k2.into()));
+        xts.encrypt_area(&mut buf, 512, 0, get_tweak_default);
+        xts_decrypt_area("xts-plain64", &key, &mut buf, 512, 0).unwrap();
+        assert_eq!(buf, plain);
+    }
+
+    #[test]
+    fn argon2_rejects_invalid_params() {
+        // memory cost 0 is below Argon2's minimum => Params::new fails.
+        let p = Argon2Params {
+            kind: "argon2id",
+            time: 1,
+            memory: 0,
+            cpus: 1,
+            salt: &[0x11u8; 16],
+        };
+        assert!(matches!(
+            derive_key_argon2(&p, b"pw", 32),
+            Err(LuksError::Unsupported {
+                what: "argon2 params",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn argon2_rejects_short_salt() {
+        // Valid params but a 4-byte salt is below Argon2's 8-byte minimum, so the
+        // hash itself fails (not Params::new).
+        let p = Argon2Params {
+            kind: "argon2id",
+            time: 1,
+            memory: 32,
+            cpus: 1,
+            salt: &[0u8; 4],
+        };
+        assert!(matches!(
+            derive_key_argon2(&p, b"pw", 32),
+            Err(LuksError::Unsupported { what: "argon2", .. })
+        ));
+    }
+
     fn hex(b: &[u8]) -> String {
         use std::fmt::Write;
         b.iter().fold(String::new(), |mut s, x| {

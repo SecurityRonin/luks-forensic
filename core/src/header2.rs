@@ -321,7 +321,7 @@ mod tests {
                 assert_eq!((*time, *memory, *cpus), (4, 32, 1));
                 assert_eq!(salt.len(), 32);
             }
-            Luks2Kdf::Pbkdf2 { .. } => panic!("expected argon2id"),
+            Luks2Kdf::Pbkdf2 { .. } => panic!("expected argon2id"), // cov:unreachable: fixture keyslot 0 is always argon2id
         }
         let seg = h.crypt_segment().unwrap();
         assert_eq!(seg.offset, 16_777_216);
@@ -378,7 +378,33 @@ mod tests {
                 assert_eq!(*iterations, 50000);
                 assert_eq!(salt.len(), 32);
             }
-            Luks2Kdf::Argon2 { .. } => panic!("expected pbkdf2"),
+            Luks2Kdf::Argon2 { .. } => panic!("expected pbkdf2"), // cov:unreachable: fixture keyslot 0 is always pbkdf2
         }
+    }
+
+    #[test]
+    fn as_u64_non_numeric_field_defaults_zero() {
+        // key_size given as a JSON bool exercises as_u64's `_ => 0` fallback.
+        let json = r#"{"keyslots":{"0":{"key_size":true,
+          "af":{"stripes":4000,"hash":"sha256"},
+          "area":{"offset":"32768","size":"128000","encryption":"aes-xts-plain64"},
+          "kdf":{"type":"pbkdf2","hash":"sha256","iterations":5,"salt":"AAAA"}}},
+          "segments":{},"digests":{}}"#;
+        let h = Luks2Header::parse(&build_luks2(json)).unwrap();
+        assert_eq!(h.keyslots.len(), 1);
+        assert_eq!(h.keyslots[0].key_size, 0);
+    }
+
+    #[test]
+    fn unknown_kdf_type_drops_keyslot() {
+        // An unrecognized kdf type hits parse_keyslot's `_ => return None`, so the
+        // keyslot is dropped rather than mis-parsed.
+        let json = r#"{"keyslots":{"0":{"key_size":64,
+          "af":{"stripes":4000,"hash":"sha256"},
+          "area":{"offset":"32768","size":"128000","encryption":"aes-xts-plain64"},
+          "kdf":{"type":"scrypt","salt":"AAAA"}}},
+          "segments":{},"digests":{}}"#;
+        let h = Luks2Header::parse(&build_luks2(json)).unwrap();
+        assert!(h.keyslots.is_empty());
     }
 }

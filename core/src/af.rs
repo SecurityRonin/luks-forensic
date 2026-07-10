@@ -93,31 +93,33 @@ pub fn material_len(block_size: usize, stripes: usize) -> usize {
     raw.div_ceil(512) * 512
 }
 
+/// Split `master` into `stripes` blocks with deterministic `filler`, the inverse
+/// of [`af_merge`] — test-only, used to build synthetic keyslots and prove the
+/// round-trip. Crate-internal so the volume unlock tests can reach it too.
+#[cfg(test)]
+pub(crate) fn af_split<D: Digest>(
+    master: &[u8],
+    block_size: usize,
+    stripes: usize,
+    filler: u8,
+) -> Vec<u8> {
+    let mut material = vec![filler; block_size * stripes];
+    let mut acc = vec![0u8; block_size];
+    for i in 0..stripes - 1 {
+        let start = i * block_size;
+        xor_into(&mut acc, &material[start..start + block_size]);
+        acc = diffuse::<D>(&acc);
+    }
+    let last = (stripes - 1) * block_size;
+    for (j, b) in acc.iter().enumerate() {
+        material[last + j] = master[j] ^ b;
+    }
+    material
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Split `master` into `stripes` blocks with deterministic "random" filler,
-    /// the inverse of [`af_merge`] — used only to prove the round-trip.
-    fn af_split<D: Digest>(
-        master: &[u8],
-        block_size: usize,
-        stripes: usize,
-        filler: u8,
-    ) -> Vec<u8> {
-        let mut material = vec![filler; block_size * stripes];
-        let mut acc = vec![0u8; block_size];
-        for i in 0..stripes - 1 {
-            let start = i * block_size;
-            xor_into(&mut acc, &material[start..start + block_size]);
-            acc = diffuse::<D>(&acc);
-        }
-        let last = (stripes - 1) * block_size;
-        for (j, b) in acc.iter().enumerate() {
-            material[last + j] = master[j] ^ b;
-        }
-        material
-    }
 
     #[test]
     fn split_then_merge_roundtrips_sha256() {
