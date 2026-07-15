@@ -7,7 +7,16 @@
 //! RustCrypto AES-XTS + PBKDF2/Argon2 key derivation); this module only wires the
 //! contract.
 
-use forensic_vfs::{CredentialSource, CryptoLayer, CryptoScheme, DynSource, VfsError, VfsResult};
+use std::io::{Read, Seek};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use forensic_vfs::adapters::SourceCursor;
+use forensic_vfs::{
+    Credential, CredentialSource, CryptoLayer, CryptoScheme, DynSource, ImageSource, VfsError,
+    VfsResult,
+};
+
+use crate::{DecryptedPayload, LuksError, LuksVolume};
 
 /// LUKS header magic (`"LUKS"` + `0xBABE`).
 const LUKS_MAGIC: &[u8; 6] = b"LUKS\xba\xbe";
@@ -49,12 +58,84 @@ impl CryptoLayer for LuksLayer {
         self.scheme
     }
 
-    fn open(&self, _creds: &dyn CredentialSource) -> VfsResult<DynSource> {
-        // RED: decryption not wired yet.
-        Err(VfsError::NeedCredentials {
-            scheme: "luks",
-            target: String::new(),
-        })
+    fn open(&self, creds: &dyn CredentialSource) -> VfsResult<DynSource> {
+        let cands = creds.credentials_for(self.scheme, "");
+        if cands.is_empty() {
+            return Err(VfsError::NeedCredentials {
+                scheme: "luks",
+                target: String::new(),
+            });
+        }
+        // A LUKS passphrase may arrive as a password or a keyfile's contents
+        // (RecoveryKey); try each over a fresh Read+Seek view of the ciphertext.
+        let mut last_err = None;
+        for cred in &cands {
+            let passphrase: &[u8] = match cred {
+                Credential::Password(p) | Credential::RecoveryKey(p) => p.as_bytes(),
+                Credential::KeyBytes(b) => b,
+                _ => continue, // KeyFile / future variants: not wired here
+            };
+            let cursor = SourceCursor::new(Arc::clone(&self.encrypted), 0, self.len);
+            match LuksVolume::unlock_with_passphrase(cursor, passphrase) {
+                Ok(payload) => return Ok(Arc::new(LuksSource::new(payload))),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.as_ref().map_or(
+            VfsError::NeedCredentials {
+                scheme: "luks",
+                target: String::new(),
+            },
+            map_luks_err,
+        ))
+    }
+}
+
+/// Translate a luks-core error into the VFS error type (a wrong passphrase / bad
+/// header is a loud [`VfsError::Decode`]).
+fn map_luks_err(e: &LuksError) -> VfsError {
+    VfsError::Decode {
+        layer: "luks",
+        offset: 0,
+        detail: e.to_string(),
+        bytes: forensic_vfs::SmallHex::new(&[]),
+    }
+}
+
+/// A decrypted LUKS payload presented as a read-only [`ImageSource`]. Reads
+/// serialize through a poison-recovering `Mutex` (the reader advances a cursor).
+struct LuksSource<R: Read + Seek> {
+    inner: Mutex<DecryptedPayload<R>>,
+    len: u64,
+}
+
+impl<R: Read + Seek> LuksSource<R> {
+    fn new(payload: DecryptedPayload<R>) -> Self {
+        let len = payload.payload_size();
+        Self {
+            inner: Mutex::new(payload),
+            len,
+        }
+    }
+}
+
+impl<R: Read + Seek + Send> ImageSource for LuksSource<R> {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        let avail = self.len.saturating_sub(offset);
+        if avail == 0 {
+            return Ok(0);
+        }
+        let want = (buf.len() as u64).min(avail) as usize;
+        let Some(dst) = buf.get_mut(..want) else {
+            return Ok(0); // cov:unreachable: want <= buf.len() by the min above
+        };
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.read_at(offset, dst).map_err(|e| map_luks_err(&e))?;
+        Ok(want)
     }
 }
 
