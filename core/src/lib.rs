@@ -28,6 +28,8 @@ mod crypto;
 mod error;
 mod header;
 mod header2;
+#[cfg(feature = "vfs")]
+pub mod vfs;
 mod volume;
 
 pub use error::{LuksError, Result};

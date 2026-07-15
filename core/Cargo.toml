@@ -14,8 +14,16 @@ categories   = ["cryptography", "filesystem", "parser-implementations"]
 [lib]
 name = "luks"
 
+[features]
+default = []
+# forensic-vfs CryptoLayer contract (optional): present a decrypted LUKS payload
+# as an ImageSource. Behind the `vfs` feature (ADR 0004). The decryption is
+# luks-core's own audited RustCrypto (AES-XTS + PBKDF2/Argon2); this only wires it.
+vfs = ["dep:forensic-vfs"]
+
 [dependencies]
 thiserror = { workspace = true }
+forensic-vfs = { version = "0.1", optional = true }
 aes       = { workspace = true }
 xts-mode  = { workspace = true }
 sha1      = { workspace = true }
