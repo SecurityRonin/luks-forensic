@@ -73,7 +73,7 @@ jobs:
       # a future change. Such lines cannot be exercised by any test and are
       # exempt. The gate fails on any OTHER zero-hit line.
       - name: Generate lcov
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
       - name: Enforce line coverage (unreachable defensive arms must carry // cov:unreachable)
         shell: bash
         run: |

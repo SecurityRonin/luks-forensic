@@ -141,11 +141,30 @@ impl<R: Read + Seek + Send> ImageSource for LuksSource<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::LuksLayer;
-    use forensic_vfs::adapters::FileSource;
-    use forensic_vfs::{Credential, CredentialSource, CryptoLayer, CryptoScheme, DynSource};
-    use sha2::{Digest, Sha256};
+    //! Always-on hermetic tests: build a valid LUKS1 aes-xts-plain64 container in
+    //! memory (with luks-core's own audited primitives), wrap it in an in-memory
+    //! [`ImageSource`], and drive every [`LuksLayer`] path — scheme detection,
+    //! successful `open`, the credential-variant loop, and the error arms. These
+    //! are Tier-3 self-consistency scaffolding; the `cryptsetup` proof is the
+    //! Tier-1 oracle in `core/tests/oracle_vfs.rs` (env-gated on `LUKS_XTS_ORACLE`).
+
+    use super::{LuksLayer, LuksSource};
+    use crate::af;
+    use crate::header::{
+        KEYSLOT_LEN, KEY_DISABLED, KEY_ENABLED, LUKS1_PHDR_LEN, LUKS_MAGIC, LUKS_NUM_KEYS,
+    };
+    use crate::LuksVolume;
+    use aes::cipher::KeyInit;
+    use aes::Aes256;
+    use forensic_vfs::{
+        Credential, CredentialSource, CryptoLayer, CryptoScheme, DynSource, ImageSource, VfsError,
+    };
+    use std::io::Cursor;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use xts_mode::Xts128;
+
+    const PASS: &[u8] = b"luks-TEST";
 
     struct FixedCreds(Vec<Credential>);
     impl CredentialSource for FixedCreds {
@@ -154,73 +173,254 @@ mod tests {
         }
     }
 
-    /// A real LUKS1 aes-xts-plain64 container (passphrase `luks-TEST`), minted on
-    /// an Ubuntu VM with `cryptsetup` 2.7.0 and staged to /tmp (env
-    /// `LUKS_XTS_ORACLE`, default path). Ground truth from `cryptsetup` itself
-    /// (Tier-1): the decrypted payload holds distinct per-sector plaintext (data
-    /// sector N filled with byte N), whose SHA-256s are asserted below. Skips if
-    /// absent.
-    fn encrypted() -> Option<DynSource> {
-        let path = std::env::var("LUKS_XTS_ORACLE")
-            .unwrap_or_else(|_| "/tmp/luks1_xts_oracle.img".to_string());
-        let src = FileSource::open(&path).ok()?;
-        Some(Arc::new(src))
+    /// An in-memory [`ImageSource`] over a `Vec<u8>` — a byte-exact, panic-free
+    /// stand-in for a file so the adapter can be exercised without touching disk.
+    struct MemSource(Vec<u8>);
+    impl ImageSource for MemSource {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> forensic_vfs::VfsResult<usize> {
+            let start = (offset as usize).min(self.0.len());
+            let end = start.saturating_add(buf.len()).min(self.0.len());
+            let n = end - start;
+            buf[..n].copy_from_slice(&self.0[start..end]);
+            Ok(n)
+        }
     }
 
-    fn sha256_hex(data: &[u8]) -> String {
-        use std::fmt::Write;
-        Sha256::digest(data).iter().fold(String::new(), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
+    fn mem(bytes: Vec<u8>) -> DynSource {
+        Arc::new(MemSource(bytes))
+    }
+
+    // ---- synthetic LUKS1 container (mirrors the volume.rs hermetic builder) ---
+
+    const L1_KM_OFF: u32 = 2; // sector 2 = byte 1024 (past the 592-byte phdr)
+    const L1_PAYLOAD_OFF: u32 = 4; // sector 4 = byte 2048
+    const L1_STRIPES: u32 = 8;
+    const L1_KEY_BYTES: u32 = 64;
+    const L1_ITERS: u32 = 5;
+    const L1_MK_ITER: u32 = 7;
+
+    fn pbkdf2_sha256(pw: &[u8], salt: &[u8], iters: u32, len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
+        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(pw, salt, iters, &mut out);
+        out
+    }
+
+    fn xts_encrypt(key: &[u8], buf: &mut [u8], unit_size: usize, base: u128) {
+        let step = (unit_size / 512).max(1) as u128;
+        let (k1, k2) = key.split_at(32);
+        let xts = Xts128::<Aes256>::new(Aes256::new(k1.into()), Aes256::new(k2.into()));
+        for (u, chunk) in buf.chunks_mut(unit_size).enumerate() {
+            let tweak = (base + u as u128 * step).to_le_bytes();
+            xts.encrypt_sector(chunk, tweak);
+        }
+    }
+
+    /// A valid LUKS1 `aes`/`xts-plain64` (AES-256-XTS) image unlocking to `master`,
+    /// carrying a 3-sector plaintext payload (data sector N = byte-pattern N).
+    fn build_luks1(master: &[u8]) -> Vec<u8> {
+        let salt = [0x11u8; 32];
+        let mk_salt = [0x22u8; 32];
+        let slot_key = pbkdf2_sha256(PASS, &salt, L1_ITERS, L1_KEY_BYTES as usize);
+
+        let mut material =
+            af::af_split::<sha2::Sha256>(master, L1_KEY_BYTES as usize, L1_STRIPES as usize, 0x5a);
+        xts_encrypt(&slot_key, &mut material, 512, 0);
+
+        let mk_digest = pbkdf2_sha256(master, &mk_salt, L1_MK_ITER, 20);
+
+        let mut payload: Vec<u8> = (0..3u64)
+            .flat_map(|s| std::iter::repeat_n(s as u8, 512))
+            .collect();
+        xts_encrypt(master, &mut payload, 512, 0);
+
+        let payload_byte = L1_PAYLOAD_OFF as usize * 512;
+        let mut img = vec![0u8; payload_byte + payload.len()];
+        img[0..6].copy_from_slice(&LUKS_MAGIC);
+        img[6..8].copy_from_slice(&1u16.to_be_bytes());
+        img[8..11].copy_from_slice(b"aes");
+        img[40..51].copy_from_slice(b"xts-plain64");
+        img[72..78].copy_from_slice(b"sha256");
+        img[104..108].copy_from_slice(&L1_PAYLOAD_OFF.to_be_bytes());
+        img[108..112].copy_from_slice(&L1_KEY_BYTES.to_be_bytes());
+        img[112..132].copy_from_slice(&mk_digest);
+        img[132..164].copy_from_slice(&mk_salt);
+        img[164..168].copy_from_slice(&L1_MK_ITER.to_be_bytes());
+        img[168..204].copy_from_slice(b"b22690e1-a392-4ecc-83b1-c1cf21200116");
+
+        for i in 0..LUKS_NUM_KEYS {
+            let base = 208 + i * KEYSLOT_LEN;
+            if i == 0 {
+                img[base..base + 4].copy_from_slice(&KEY_ENABLED.to_be_bytes());
+                img[base + 4..base + 8].copy_from_slice(&L1_ITERS.to_be_bytes());
+                img[base + 8..base + 40].copy_from_slice(&salt);
+                img[base + 40..base + 44].copy_from_slice(&L1_KM_OFF.to_be_bytes());
+                img[base + 44..base + 48].copy_from_slice(&L1_STRIPES.to_be_bytes());
+            } else {
+                img[base..base + 4].copy_from_slice(&KEY_DISABLED.to_be_bytes());
+            }
+        }
+
+        let km_byte = L1_KM_OFF as usize * 512;
+        img[km_byte..km_byte + material.len()].copy_from_slice(&material);
+        img[payload_byte..payload_byte + payload.len()].copy_from_slice(&payload);
+        assert!(LUKS1_PHDR_LEN <= km_byte);
+        img
+    }
+
+    fn master() -> Vec<u8> {
+        (0..64u8)
+            .map(|x| x.wrapping_mul(7).wrapping_add(3))
+            .collect()
+    }
+
+    // ---- scheme detection --------------------------------------------------
+
+    #[test]
+    fn detects_luks1_scheme() {
+        let layer = LuksLayer::new(mem(build_luks1(&master())));
+        assert_eq!(layer.scheme(), CryptoScheme::Luks1);
     }
 
     #[test]
-    fn luks_cryptolayer_decrypts_aes_xts() {
-        let Some(enc) = encrypted() else {
-            eprintln!("skip: no LUKS image (set LUKS_XTS_ORACLE)");
-            return;
-        };
-        let layer = LuksLayer::new(enc);
-        assert_eq!(layer.scheme(), CryptoScheme::Luks1);
+    fn non_luks1_header_reports_luks2() {
+        // Anything that is not a well-formed LUKS1 magic+version-1 header is
+        // reported as Luks2 (the on-disk version byte drives the branch at line 46).
+        let layer = LuksLayer::new(mem(vec![0u8; 8]));
+        assert_eq!(layer.scheme(), CryptoScheme::Luks2);
 
-        let creds = FixedCreds(vec![Credential::Password("luks-TEST".to_string())]);
-        let dec: DynSource = layer.open(&creds).expect("unlock luks aes-xts");
+        // A LUKS magic with version 2 is Luks2 too.
+        let mut hdr = vec![0u8; 4096];
+        hdr[0..6].copy_from_slice(&LUKS_MAGIC);
+        hdr[6..8].copy_from_slice(&2u16.to_be_bytes());
+        assert_eq!(LuksLayer::new(mem(hdr)).scheme(), CryptoScheme::Luks2);
+    }
 
-        // cryptsetup oracle: distinct per-sector plaintext (data sector N = byte N).
-        // Matching sectors 0/1/8/15 proves correct XTS per-sector tweak AND the
-        // payload-offset alignment (identical plaintext would not).
-        for (sec, expected) in [
-            (
-                0u64,
-                "076a27c79e5ace2a3d47f9dd2e83e4ff6ea8872b3c2218f66c92b89b55f36560",
-            ),
-            (
-                1,
-                "6caf38d537984e261527b8caef5f990fb91415a1db917198821a79ed28997973",
-            ),
-            (
-                8,
-                "7debd4d73a98c0df9eb7b083fd21033d7bd0907b3947f22338d8c82154face23",
-            ),
-            (
-                15,
-                "941657fde04ff270f8ae019ede5287c71d887758641536ab0eb87a0d434526bd",
-            ),
-        ] {
+    // ---- open(): success over each wired credential variant ----------------
+
+    fn assert_decrypts(layer: &LuksLayer, creds: &FixedCreds) {
+        let dec: DynSource = layer.open(creds).expect("unlock");
+        // Payload sector N is byte-pattern N; matching several proves the XTS
+        // per-sector tweak and payload-offset alignment.
+        for sec in 0u64..3 {
             let mut buf = [0u8; 512];
-            assert_eq!(
-                dec.read_at(sec * 512, &mut buf).expect("read decrypted"),
-                512
-            );
-            assert_eq!(
-                sha256_hex(&buf),
-                expected,
-                "sector {sec} vs cryptsetup oracle"
-            );
+            assert_eq!(dec.read_at(sec * 512, &mut buf).expect("read"), 512);
+            assert!(buf.iter().all(|&b| b == sec as u8), "sector {sec}");
         }
+    }
 
-        // No credentials offered → NeedCredentials, never a guess or panic.
-        assert!(layer.open(&FixedCreds(vec![])).is_err());
+    #[test]
+    fn open_succeeds_with_password() {
+        let layer = LuksLayer::new(mem(build_luks1(&master())));
+        assert_decrypts(
+            &layer,
+            &FixedCreds(vec![Credential::Password("luks-TEST".to_string())]),
+        );
+    }
+
+    #[test]
+    fn open_succeeds_with_recovery_key_and_key_bytes() {
+        let layer = LuksLayer::new(mem(build_luks1(&master())));
+        // RecoveryKey carries the passphrase as text.
+        assert_decrypts(
+            &layer,
+            &FixedCreds(vec![Credential::RecoveryKey("luks-TEST".to_string())]),
+        );
+        // KeyBytes carries it as raw bytes.
+        assert_decrypts(
+            &layer,
+            &FixedCreds(vec![Credential::KeyBytes(PASS.to_vec())]),
+        );
+    }
+
+    #[test]
+    fn open_skips_unwired_variant_then_succeeds() {
+        // A KeyFile credential is not wired here — it is skipped, and a following
+        // Password still unlocks (the `_ => continue` arm plus a later success).
+        let layer = LuksLayer::new(mem(build_luks1(&master())));
+        assert_decrypts(
+            &layer,
+            &FixedCreds(vec![
+                Credential::KeyFile(PathBuf::from("/nonexistent.key")),
+                Credential::Password("luks-TEST".to_string()),
+            ]),
+        );
+    }
+
+    // ---- open(): error arms ------------------------------------------------
+
+    /// The `Ok` arm of `open` (a `DynSource`) is not `Debug`, so match rather than
+    /// `unwrap_err()`; return the error for the caller to assert on.
+    fn open_err(layer: &LuksLayer, creds: &FixedCreds) -> VfsError {
+        match layer.open(creds) {
+            Ok(_) => panic!("expected open to fail"), // cov:unreachable: callers pass only failing creds
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn open_with_no_credentials_needs_credentials() {
+        let layer = LuksLayer::new(mem(build_luks1(&master())));
+        let err = open_err(&layer, &FixedCreds(vec![]));
+        assert!(matches!(
+            err,
+            VfsError::NeedCredentials { scheme: "luks", .. }
+        ));
+    }
+
+    #[test]
+    fn open_only_unwired_credentials_needs_credentials() {
+        // Every candidate is an unwired variant → the loop makes no attempt, so
+        // `last_err` is None and the fallback is NeedCredentials, not Decode.
+        let layer = LuksLayer::new(mem(build_luks1(&master())));
+        let err = open_err(
+            &layer,
+            &FixedCreds(vec![Credential::KeyFile(PathBuf::from("x"))]),
+        );
+        assert!(matches!(
+            err,
+            VfsError::NeedCredentials { scheme: "luks", .. }
+        ));
+    }
+
+    #[test]
+    fn open_wrong_passphrase_is_loud_decode() {
+        // A wired-but-wrong passphrase sets `last_err`, surfaced as a loud Decode
+        // via `map_luks_err` (never a silent guess or panic).
+        let layer = LuksLayer::new(mem(build_luks1(&master())));
+        let err = open_err(
+            &layer,
+            &FixedCreds(vec![Credential::Password("wrong".to_string())]),
+        );
+        match err {
+            VfsError::Decode { layer, .. } => assert_eq!(layer, "luks"),
+            other => panic!("expected Decode, got {other:?}"), // cov:unreachable: a wrong passphrase always maps to Decode
+        }
+    }
+
+    // ---- LuksSource: len / read_at boundaries ------------------------------
+
+    #[test]
+    fn luks_source_len_and_read_bounds() {
+        let payload =
+            LuksVolume::unlock1_with_passphrase(Cursor::new(build_luks1(&master())), PASS)
+                .expect("unlock");
+        let expected_len = payload.payload_size();
+        let src: DynSource = Arc::new(LuksSource::new(payload));
+        assert_eq!(src.len(), expected_len);
+        assert!(!src.is_empty());
+
+        // A read that straddles EOF returns only the available prefix.
+        let mut buf = vec![0u8; 512];
+        let got = src
+            .read_at(expected_len - 256, &mut buf)
+            .expect("read tail");
+        assert_eq!(got as u64, 256);
+
+        // A read starting at/after EOF returns 0.
+        let mut z = [0u8; 16];
+        assert_eq!(src.read_at(expected_len, &mut z).expect("eof read"), 0);
     }
 }

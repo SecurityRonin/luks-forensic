@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2]
+
+### Added
+
+- `luks-core`: optional `forensic-vfs` `CryptoLayer` adapter (`luks::vfs::LuksLayer`)
+  behind the `vfs` feature. Wraps an encrypted LUKS1/LUKS2 volume and, given a
+  passphrase (`Password` / `RecoveryKey` / `KeyBytes` credential), presents the
+  decrypted payload as a `forensic-vfs` `ImageSource` a filesystem mounts
+  unchanged. Decryption is luks-core's own audited RustCrypto AES-XTS +
+  PBKDF2/Argon2 derivation; the adapter only wires the contract. Requires
+  `forensic-vfs` 0.2.
+
 ## [0.1.1]
 
 ### Added
