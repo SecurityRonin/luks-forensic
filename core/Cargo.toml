@@ -23,7 +23,7 @@ vfs = ["dep:forensic-vfs"]
 
 [dependencies]
 thiserror = { workspace = true }
-forensic-vfs = { version = "0.1", optional = true }
+forensic-vfs = { version = "0.2", optional = true }
 aes       = { workspace = true }
 xts-mode  = { workspace = true }
 sha1      = { workspace = true }
