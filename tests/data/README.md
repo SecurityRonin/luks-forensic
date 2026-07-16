@@ -38,6 +38,19 @@ Ground truth for both is captured in `/tmp/luks-oracle/GROUND-TRUTH.md`.
 - **Oracle**: `cryptsetup` 2.7.0 — decrypted sectors match byte-for-byte.
 - **Consumed by**: `core/tests/oracle_luks2.rs`, env `LUKS2_ORACLE`.
 
+#### luks1_xts_oracle.img (forensic-vfs CryptoLayer adapter — `LUKS_XTS_ORACLE`)
+
+- **Source**: self-minted on the same Ubuntu guest. `cryptsetup luksFormat
+  --type luks1 --cipher aes-xts-plain64 --key-size 512 --hash sha256
+  --iter-time 100`, 8 MiB file, then the decrypted mapper filled with distinct
+  per-sector plaintext (data sector N = byte N) via `dd`.
+- **Passphrase**: `luks-TEST`. **Payload offset**: 4096 sectors.
+- **Oracle**: `cryptsetup` 2.7.0 — decrypted data sectors 0/1/8/15 have SHA-256
+  `076a27c7…` / `6caf38d5…` / `7debd4d7…` / `941657fd…`. Distinct-per-sector
+  plaintext validates the XTS per-sector tweak *and* payload-offset alignment.
+- **Consumed by**: `core/src/vfs.rs` (`luks_cryptolayer_decrypts_aes_xts`), env
+  `LUKS_XTS_ORACLE` (default `/tmp/luks1_xts_oracle.img`).
+
 ## Redistribution
 
 Both images are self-minted by Security Ronin and contain no third-party
