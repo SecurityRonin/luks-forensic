@@ -30,6 +30,8 @@ mod header;
 mod header2;
 #[cfg(feature = "vfs")]
 pub mod vfs;
+#[cfg(feature = "vfs")]
+pub use vfs::LuksLayer;
 mod volume;
 
 pub use error::{LuksError, Result};

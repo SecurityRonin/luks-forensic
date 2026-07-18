@@ -16,7 +16,7 @@ name = "luks"
 
 [features]
 default = []
-# forensic-vfs CryptoLayer contract (optional): present a decrypted LUKS payload
+# forensic-vfs EncryptionLayer contract (optional): present a decrypted LUKS payload
 # as an ImageSource. Behind the `vfs` feature (ADR 0004). The decryption is
 # luks-core's own audited RustCrypto (AES-XTS + PBKDF2/Argon2); this only wires it.
 vfs = ["dep:forensic-vfs"]

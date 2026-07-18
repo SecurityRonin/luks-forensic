@@ -1,4 +1,4 @@
-//! `forensic-vfs` [`CryptoLayer`] adapter for LUKS1 / LUKS2, behind the `vfs`
+//! `forensic-vfs` [`EncryptionLayer`] adapter for LUKS1 / LUKS2, behind the `vfs`
 //! feature.
 //!
 //! Wraps an encrypted LUKS volume (a parent [`ImageSource`]) and, given a
@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use forensic_vfs::adapters::SourceCursor;
 use forensic_vfs::{
-    Credential, CredentialSource, CryptoLayer, CryptoScheme, DynSource, ImageSource, VfsError,
-    VfsResult,
+    Credential, CredentialSource, DynSource, EncryptionLayer, EncryptionScheme, ImageSource,
+    VfsError, VfsResult,
 };
 
 use crate::{DecryptedPayload, LuksError, LuksVolume};
@@ -21,11 +21,11 @@ use crate::{DecryptedPayload, LuksError, LuksVolume};
 /// LUKS header magic (`"LUKS"` + `0xBABE`).
 const LUKS_MAGIC: &[u8; 6] = b"LUKS\xba\xbe";
 
-/// A LUKS-encrypted volume presented as a [`CryptoLayer`].
+/// A LUKS-encrypted volume presented as a [`EncryptionLayer`].
 pub struct LuksLayer {
     encrypted: DynSource,
     len: u64,
-    scheme: CryptoScheme,
+    scheme: EncryptionScheme,
 }
 
 impl LuksLayer {
@@ -41,9 +41,9 @@ impl LuksLayer {
                     && hdr.starts_with(LUKS_MAGIC)
                     && u16::from_be_bytes([hdr[6], hdr[7]]) == 1 =>
             {
-                CryptoScheme::Luks1
+                EncryptionScheme::Luks1
             }
-            _ => CryptoScheme::Luks2,
+            _ => EncryptionScheme::Luks2,
         };
         Self {
             encrypted,
@@ -53,8 +53,8 @@ impl LuksLayer {
     }
 }
 
-impl CryptoLayer for LuksLayer {
-    fn scheme(&self) -> CryptoScheme {
+impl EncryptionLayer for LuksLayer {
+    fn scheme(&self) -> EncryptionScheme {
         self.scheme
     }
 
@@ -157,7 +157,8 @@ mod tests {
     use aes::cipher::KeyInit;
     use aes::Aes256;
     use forensic_vfs::{
-        Credential, CredentialSource, CryptoLayer, CryptoScheme, DynSource, ImageSource, VfsError,
+        Credential, CredentialSource, DynSource, EncryptionLayer, EncryptionScheme, ImageSource,
+        VfsError,
     };
     use std::io::Cursor;
     use std::path::PathBuf;
@@ -168,7 +169,7 @@ mod tests {
 
     struct FixedCreds(Vec<Credential>);
     impl CredentialSource for FixedCreds {
-        fn credentials_for(&self, _scheme: CryptoScheme, _target: &str) -> Vec<Credential> {
+        fn credentials_for(&self, _scheme: EncryptionScheme, _target: &str) -> Vec<Credential> {
             self.0.clone()
         }
     }
@@ -281,7 +282,7 @@ mod tests {
     #[test]
     fn detects_luks1_scheme() {
         let layer = LuksLayer::new(mem(build_luks1(&master())));
-        assert_eq!(layer.scheme(), CryptoScheme::Luks1);
+        assert_eq!(layer.scheme(), EncryptionScheme::Luks1);
     }
 
     #[test]
@@ -289,13 +290,13 @@ mod tests {
         // Anything that is not a well-formed LUKS1 magic+version-1 header is
         // reported as Luks2 (the on-disk version byte drives the branch at line 46).
         let layer = LuksLayer::new(mem(vec![0u8; 8]));
-        assert_eq!(layer.scheme(), CryptoScheme::Luks2);
+        assert_eq!(layer.scheme(), EncryptionScheme::Luks2);
 
         // A LUKS magic with version 2 is Luks2 too.
         let mut hdr = vec![0u8; 4096];
         hdr[0..6].copy_from_slice(&LUKS_MAGIC);
         hdr[6..8].copy_from_slice(&2u16.to_be_bytes());
-        assert_eq!(LuksLayer::new(mem(hdr)).scheme(), CryptoScheme::Luks2);
+        assert_eq!(LuksLayer::new(mem(hdr)).scheme(), EncryptionScheme::Luks2);
     }
 
     // ---- open(): success over each wired credential variant ----------------

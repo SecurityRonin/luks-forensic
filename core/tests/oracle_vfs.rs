@@ -1,4 +1,4 @@
-//! Tier-1 oracle: drive the `forensic-vfs` [`LuksLayer`] `CryptoLayer` over a
+//! Tier-1 oracle: drive the `forensic-vfs` [`LuksLayer`] `EncryptionLayer` over a
 //! real `cryptsetup`-minted LUKS1 aes-xts-plain64 container and confirm the
 //! decrypted sectors match `cryptsetup` byte-for-byte (SHA-256).
 //!
@@ -17,13 +17,13 @@
 use std::sync::Arc;
 
 use forensic_vfs::adapters::FileSource;
-use forensic_vfs::{Credential, CredentialSource, CryptoLayer, CryptoScheme, DynSource};
+use forensic_vfs::{Credential, CredentialSource, DynSource, EncryptionLayer, EncryptionScheme};
 use luks::vfs::LuksLayer;
 use sha2::{Digest, Sha256};
 
 struct FixedCreds(Vec<Credential>);
 impl CredentialSource for FixedCreds {
-    fn credentials_for(&self, _scheme: CryptoScheme, _target: &str) -> Vec<Credential> {
+    fn credentials_for(&self, _scheme: EncryptionScheme, _target: &str) -> Vec<Credential> {
         self.0.clone()
     }
 }
@@ -50,7 +50,7 @@ fn luks_cryptolayer_decrypts_aes_xts() {
         return;
     };
     let layer = LuksLayer::new(enc);
-    assert_eq!(layer.scheme(), CryptoScheme::Luks1);
+    assert_eq!(layer.scheme(), EncryptionScheme::Luks1);
 
     let creds = FixedCreds(vec![Credential::Password("luks-TEST".to_string())]);
     let dec: DynSource = layer.open(&creds).expect("unlock luks aes-xts");
