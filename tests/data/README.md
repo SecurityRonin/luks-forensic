@@ -38,7 +38,7 @@ Ground truth for both is captured in `/tmp/luks-oracle/GROUND-TRUTH.md`.
 - **Oracle**: `cryptsetup` 2.7.0 — decrypted sectors match byte-for-byte.
 - **Consumed by**: `core/tests/oracle_luks2.rs`, env `LUKS2_ORACLE`.
 
-#### luks1_xts_oracle.img (forensic-vfs CryptoLayer adapter — `LUKS_XTS_ORACLE`)
+#### luks1_xts_oracle.img (forensic-vfs EncryptionLayer adapter — `LUKS_XTS_ORACLE`)
 
 - **Source**: self-minted on the same Ubuntu guest. `cryptsetup luksFormat
   --type luks1 --cipher aes-xts-plain64 --key-size 512 --hash sha256
