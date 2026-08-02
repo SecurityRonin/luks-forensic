@@ -33,6 +33,28 @@ pub enum LuksError {
         value: String,
     },
 
+    /// The keyslot demands more key-derivation work than the wall-clock budget
+    /// allows. The iteration count comes from the header, so a crafted container
+    /// can ask for billions of rounds; refusing is the only way the tool stays
+    /// responsive on hostile input.
+    ///
+    /// A *refusal*, never a silent reduction: deriving with fewer rounds than the
+    /// header specifies produces a different key, which would report a wrong
+    /// passphrase for a container that would in fact have opened.
+    #[error(
+        "key derivation would take about {projected_secs}s for {iterations} iterations, \
+         over the {budget_secs}s budget — refusing rather than clamping, because a \
+         reduced iteration count derives a different key"
+    )]
+    DerivationBudgetExceeded {
+        /// The iteration count the header asked for, verbatim.
+        iterations: u32,
+        /// Projected cost on this machine, measured from a calibration run.
+        projected_secs: u64,
+        /// The budget that was exceeded.
+        budget_secs: u64,
+    },
+
     /// The header is structurally malformed (a field runs past the buffer).
     #[error("malformed LUKS header: {what} (need {need} bytes, have {got})")]
     MalformedHeader {
