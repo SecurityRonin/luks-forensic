@@ -144,6 +144,49 @@ mod tests {
     use super::*;
     use xts_mode::get_tweak_default;
 
+    /// A header-supplied iteration count is attacker-controlled, so a crafted
+    /// container must not be able to spend the process. The fuzz target found
+    /// this the expensive way: `libFuzzer: timeout after 1780 seconds` on the
+    /// `unlock` target, seeded from the `"sha1"` dictionary entry.
+    ///
+    /// The assertion runs the derivation on a worker thread behind a watchdog,
+    /// so an unbounded implementation fails this test in seconds instead of
+    /// hanging the suite — a red that terminates is the only useful kind.
+    #[test]
+    fn absurd_iteration_count_is_refused_rather_than_run() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let r = derive_key("sha1", b"luks-TEST", b"salt", u32::MAX, 32);
+            let _ = tx.send(r.is_err());
+        });
+
+        match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(refused) => assert!(
+                refused,
+                "u32::MAX iterations must be refused, not completed"
+            ),
+            Err(_) => panic!(
+                "derive_key did not return within 60s for u32::MAX iterations — \
+                 the derivation is unbounded"
+            ),
+        }
+    }
+
+    /// The budget must not reject work a real container asks for. cryptsetup
+    /// lands around 1–4M iterations for LUKS1, so a count in that range has to
+    /// go through untouched and produce the same key as an unbudgeted run.
+    #[test]
+    fn a_realistic_iteration_count_still_derives() {
+        let k = derive_key("sha256", b"password", b"salt", 200_000, 32).unwrap();
+        assert_eq!(k.len(), 32);
+        // Same input, same key — the budget check must not perturb the result.
+        let again = derive_key("sha256", b"password", b"salt", 200_000, 32).unwrap();
+        assert_eq!(k, again);
+    }
+
     #[test]
     fn derive_key_matches_known_pbkdf2_sha256() {
         // PBKDF2-HMAC-SHA256("password","salt",1,32) — cross-checked vs Python.
