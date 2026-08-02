@@ -8,12 +8,66 @@ use aes::cipher::KeyInit;
 use aes::{Aes128, Aes256};
 use xts_mode::Xts128;
 
+use std::time::{Duration, Instant};
+
 use crate::error::{LuksError, Result};
+
+/// Wall-clock ceiling for a single PBKDF2 derivation.
+///
+/// A LUKS keyslot names its own iteration count, so the work is chosen by the
+/// container rather than by us. Real ones are cheap — cryptsetup calibrates to
+/// roughly a second — so a budget an order of magnitude above that refuses
+/// hostile headers without ever getting in a genuine container's way.
+pub const DERIVATION_BUDGET: Duration = Duration::from_secs(30);
+
+/// Iterations timed to measure this machine's PBKDF2 rate before committing to
+/// the full count. Large enough to swamp timer noise, small enough that paying
+/// it twice on the accepted path is irrelevant.
+const CALIBRATION_ITERS: u32 = 20_000;
+
+fn pbkdf2_into(
+    hash_spec: &str,
+    password: &[u8],
+    salt: &[u8],
+    iters: u32,
+    out: &mut [u8],
+) -> Result<()> {
+    match hash_spec {
+        "sha1" => pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password, salt, iters, out),
+        "sha256" => pbkdf2::pbkdf2_hmac::<sha2::Sha256>(password, salt, iters, out),
+        "sha512" => pbkdf2::pbkdf2_hmac::<sha2::Sha512>(password, salt, iters, out),
+        other => {
+            return Err(LuksError::Unsupported {
+                what: "hash",
+                value: other.to_string(),
+            })
+        }
+    }
+    Ok(())
+}
 
 /// Derive `key_len` bytes with PBKDF2-HMAC-`hash_spec`.
 ///
+/// Costs above [`DERIVATION_BUDGET`] are refused before the work starts. The
+/// bound is on projected wall-clock rather than on the iteration count itself,
+/// because "too many rounds" is a property of the machine doing the work, not a
+/// number that can be fixed in advance — and a count that is absurd on a laptop
+/// may be routine on a workstation.
+///
+/// The projection comes from timing a short [`CALIBRATION_ITERS`] run and scaling
+/// it: PBKDF2 is exactly linear in its iteration count, so the estimate is sound.
+/// The alternative — checking a deadline inside the iteration loop — would mean
+/// hand-rolling PBKDF2 around a raw HMAC, and this module derives every primitive
+/// from an audited RustCrypto crate on purpose.
+///
+/// One consequence is worth stating plainly: acceptance is machine-dependent, so
+/// a container near the budget can be refused on a slow host and accepted on a
+/// fast one. The error names the projection and the budget so that is visible
+/// rather than mysterious.
+///
 /// # Errors
-/// [`LuksError::Unsupported`] for a hash spec with no implementation.
+/// [`LuksError::Unsupported`] for a hash spec with no implementation;
+/// [`LuksError::DerivationBudgetExceeded`] when the projected cost is over budget.
 pub fn derive_key(
     hash_spec: &str,
     password: &[u8],
@@ -23,17 +77,30 @@ pub fn derive_key(
 ) -> Result<Vec<u8>> {
     let mut out = vec![0u8; key_len];
     let iters = iterations.max(1);
-    match hash_spec {
-        "sha1" => pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password, salt, iters, &mut out),
-        "sha256" => pbkdf2::pbkdf2_hmac::<sha2::Sha256>(password, salt, iters, &mut out),
-        "sha512" => pbkdf2::pbkdf2_hmac::<sha2::Sha512>(password, salt, iters, &mut out),
-        other => {
-            return Err(LuksError::Unsupported {
-                what: "hash",
-                value: other.to_string(),
-            })
+
+    if iters > CALIBRATION_ITERS {
+        let mut probe = vec![0u8; key_len];
+        let started = Instant::now();
+        pbkdf2_into(hash_spec, password, salt, CALIBRATION_ITERS, &mut probe)?;
+        let measured = started.elapsed();
+
+        // Scale in nanos so a sub-microsecond per-iteration cost does not round
+        // to zero, and saturate rather than overflow: u32::MAX iterations times
+        // any real per-iteration cost leaves u64 nanoseconds far behind.
+        let projected_nanos =
+            measured.as_nanos().saturating_mul(u128::from(iters)) / u128::from(CALIBRATION_ITERS);
+        let projected = Duration::from_nanos(u64::try_from(projected_nanos).unwrap_or(u64::MAX));
+
+        if projected > DERIVATION_BUDGET {
+            return Err(LuksError::DerivationBudgetExceeded {
+                iterations: iters,
+                projected_secs: projected.as_secs(),
+                budget_secs: DERIVATION_BUDGET.as_secs(),
+            });
         }
     }
+
+    pbkdf2_into(hash_spec, password, salt, iters, &mut out)?;
     Ok(out)
 }
 
@@ -160,17 +227,27 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let r = derive_key("sha1", b"luks-TEST", b"salt", u32::MAX, 32);
-            let _ = tx.send(r.is_err());
+            // Assert the *reason*, not merely that something failed: an
+            // is_err() check would pass just as happily on an unrelated error
+            // and prove nothing about the budget.
+            let budgeted = matches!(
+                r,
+                Err(LuksError::DerivationBudgetExceeded { iterations, .. })
+                    if iterations == u32::MAX
+            );
+            let _ = tx.send(budgeted);
         });
 
         match rx.recv_timeout(Duration::from_secs(60)) {
             Ok(refused) => assert!(
                 refused,
-                "u32::MAX iterations must be refused, not completed"
+                "u32::MAX iterations must be refused with DerivationBudgetExceeded"
             ),
-            Err(_) => panic!(
-                "derive_key did not return within 60s for u32::MAX iterations — \
-                 the derivation is unbounded"
+            // `RecvTimeoutError` separates "still grinding" from "worker died",
+            // so name it rather than collapsing both into one message.
+            Err(e) => panic!(
+                "derive_key did not return within 60s for u32::MAX iterations \
+                 ({e}) — the derivation is unbounded"
             ),
         }
     }
