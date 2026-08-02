@@ -238,18 +238,17 @@ mod tests {
             let _ = tx.send(budgeted);
         });
 
-        match rx.recv_timeout(Duration::from_secs(60)) {
-            Ok(refused) => assert!(
-                refused,
-                "u32::MAX iterations must be refused with DerivationBudgetExceeded"
-            ),
-            // `RecvTimeoutError` separates "still grinding" from "worker died",
-            // so name it rather than collapsing both into one message.
-            Err(e) => panic!(
-                "derive_key did not return within 60s for u32::MAX iterations \
-                 ({e}) — the derivation is unbounded"
-            ),
-        }
+        // `.expect` rather than a match arm: the timeout branch is unreachable
+        // while the budget holds, and an arm that never runs is a line the
+        // coverage gate would have to exempt for no gain. The panic message is
+        // the whole diagnosis if the bound ever regresses.
+        let refused = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("derive_key did not return within 60s for u32::MAX iterations — unbounded");
+        assert!(
+            refused,
+            "u32::MAX iterations must be refused with DerivationBudgetExceeded"
+        );
     }
 
     /// The budget must not reject work a real container asks for. cryptsetup
