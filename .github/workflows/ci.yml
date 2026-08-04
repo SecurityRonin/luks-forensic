@@ -17,7 +17,7 @@ jobs:
   # derived from rust-version (1.81), coverage is already the per-line gate at
   # --workspace --all-features, and core/fuzz is discovered automatically.
   ci:
-    uses: SecurityRonin/fleet-ci/.github/workflows/rust-ci.yml@f49dff5ddb19b17f69926210abb70f78c14c29e2
+    uses: SecurityRonin/fleet-ci/.github/workflows/rust-ci.yml@6b5502293ffb656c7ded8998c5acc704b5cee431
 
   # Repo-specific, so it stays here rather than moving into the shared workflow.
   docs:
