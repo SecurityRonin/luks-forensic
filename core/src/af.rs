@@ -157,7 +157,45 @@ mod tests {
 
     #[test]
     fn material_len_rounds_to_sector() {
-        assert_eq!(material_len(64, 4000), 256_000); // 256000 already sector-aligned
-        assert_eq!(material_len(64, 1), 512); // 64 -> rounds up to 512
+        // 256000 already sector-aligned; 64 rounds up to 512.
+        assert_eq!(material_len(64, 4000).unwrap(), 256_000);
+        assert_eq!(material_len(64, 1).unwrap(), 512);
+    }
+
+    /// The stripe count is a header field, so it is chosen by the container. It
+    /// sizes the key-material buffer the caller allocates — `vec![0u8; len]` —
+    /// so an unbounded value is a request to allocate on demand: 64 bytes times
+    /// `u32::MAX` stripes is roughly 275 GB.
+    ///
+    /// Real containers use 4000 (LUKS1 fixes it there, and cryptsetup writes the
+    /// same for LUKS2), so refusing far above that costs nothing real.
+    #[test]
+    fn an_absurd_stripe_count_is_refused_before_sizing_a_buffer() {
+        let err = material_len(64, u32::MAX as usize)
+            .expect_err("a 275 GB key-material buffer must be refused, not returned");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&(u32::MAX as usize).to_string()),
+            "the refusal must name the stripe count asked for: {msg}"
+        );
+    }
+
+    /// `merge` is re-exported as the public `af_merge`, so it cannot rely on a
+    /// caller having gone through `material_len` first: it loops `stripes - 1`
+    /// times and must refuse an absurd count on its own.
+    #[test]
+    fn merge_refuses_an_absurd_stripe_count_without_looping() {
+        assert!(matches!(
+            merge("sha256", &[0u8; 64], 64, u32::MAX as usize),
+            Err(LuksError::ImplausibleStripes { .. })
+        ));
+    }
+
+    /// The bound must not reject what a real container asks for.
+    #[test]
+    fn a_real_stripe_count_still_merges() {
+        let master = [0x5Au8; 64];
+        let split = af_split::<Sha256>(&master, 64, 4000, 0xA5);
+        assert_eq!(merge("sha256", &split, 64, 4000).unwrap(), master);
     }
 }
