@@ -55,6 +55,25 @@ pub enum LuksError {
         budget_secs: u64,
     },
 
+    /// The Argon2 keyslot demands more memory than the ceiling allows.
+    ///
+    /// Separate from [`Self::DerivationBudgetExceeded`] because memory cannot be
+    /// bounded the same way: a time cost can be measured and projected, but
+    /// *attempting* an oversized allocation is itself the harm — the process is
+    /// killed by the OS before any deadline could fire. `argon2::Params` caps
+    /// `m_cost` at `u32::MAX` 1 KiB blocks (4 TiB) and the header chooses the
+    /// value, so the ceiling has to be ours.
+    #[error(
+        "argon2 keyslot asks for {requested_kib} KiB of memory, over the \
+         {max_kib} KiB ceiling — refusing before allocating"
+    )]
+    DerivationMemoryExceeded {
+        /// The memory cost the header asked for, verbatim, in KiB blocks.
+        requested_kib: u32,
+        /// The ceiling that was exceeded, in KiB blocks.
+        max_kib: u32,
+    },
+
     /// The header is structurally malformed (a field runs past the buffer).
     #[error("malformed LUKS header: {what} (need {need} bytes, have {got})")]
     MalformedHeader {

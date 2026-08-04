@@ -118,10 +118,37 @@ pub struct Argon2Params<'a> {
     pub salt: &'a [u8],
 }
 
+/// Ceiling on the Argon2 memory cost a keyslot may demand, in KiB blocks.
+///
+/// `argon2::Params` caps `m_cost` at `u32::MAX` blocks — 4 TiB — and the header
+/// chooses the value, so the real ceiling has to be ours. cryptsetup benchmarks
+/// LUKS2 keyslots to at most about 1 GiB, so 4 GiB is generous headroom over
+/// anything a genuine container asks for.
+const MAX_ARGON2_MEMORY_KIB: u32 = 4 * 1024 * 1024;
+
 /// Derive `key_len` bytes with Argon2 (LUKS2 keyslot KDF).
 ///
+/// Both cost axes come from the keyslot and are therefore attacker-chosen, and
+/// they need different treatment:
+///
+/// * **Memory** is capped outright. It cannot be bounded by wall clock the way
+///   the time cost is, because *attempting* an oversized allocation is itself
+///   the harm — a `u32::MAX` memory cost gets the process killed by the OS
+///   before any deadline could fire (observed: SIGKILL, not a slow return).
+/// * **Time** is the Argon2 analogue of the PBKDF2 iteration count and is
+///   bounded the same way: one pass is measured, the total projected, and the
+///   whole derivation refused if it would exceed [`DERIVATION_BUDGET`]. Argon2
+///   is linear in `t_cost`, so scaling a single pass is sound.
+///
+/// The calibration pass runs at the requested memory cost, which is why the
+/// memory ceiling is enforced first: the measurement must itself be safe.
+/// Calibrating costs one extra pass out of `t_cost`, so the overhead shrinks as
+/// the input gets more hostile and is at worst a doubling at `t_cost = 2`.
+///
 /// # Errors
-/// [`LuksError::Unsupported`] for an unknown Argon2 variant or invalid params.
+/// [`LuksError::Unsupported`] for an unknown Argon2 variant or invalid params;
+/// [`LuksError::DerivationMemoryExceeded`] over the memory ceiling;
+/// [`LuksError::DerivationBudgetExceeded`] when the projected time is over budget.
 pub fn derive_key_argon2(p: &Argon2Params, password: &[u8], key_len: usize) -> Result<Vec<u8>> {
     use argon2::{Algorithm, Argon2, Params, Version};
     let algo = match p.kind {
@@ -134,19 +161,50 @@ pub fn derive_key_argon2(p: &Argon2Params, password: &[u8], key_len: usize) -> R
             })
         }
     };
-    let params = Params::new(p.memory, p.time, p.cpus, Some(key_len)).map_err(|e| {
-        LuksError::Unsupported {
-            what: "argon2 params",
-            value: e.to_string(),
-        }
-    })?;
-    let mut out = vec![0u8; key_len];
-    Argon2::new(algo, Version::V0x13, params)
-        .hash_password_into(password, p.salt, &mut out)
-        .map_err(|e| LuksError::Unsupported {
-            what: "argon2",
-            value: e.to_string(),
+
+    // Before anything allocates, including the calibration pass below.
+    if p.memory > MAX_ARGON2_MEMORY_KIB {
+        return Err(LuksError::DerivationMemoryExceeded {
+            requested_kib: p.memory,
+            max_kib: MAX_ARGON2_MEMORY_KIB,
+        });
+    }
+
+    let run = |time: u32, out: &mut [u8]| -> Result<()> {
+        let params = Params::new(p.memory, time, p.cpus, Some(key_len)).map_err(|e| {
+            LuksError::Unsupported {
+                what: "argon2 params",
+                value: e.to_string(),
+            }
         })?;
+        Argon2::new(algo, Version::V0x13, params)
+            .hash_password_into(password, p.salt, out)
+            .map_err(|e| LuksError::Unsupported {
+                what: "argon2",
+                value: e.to_string(),
+            })
+    };
+
+    if p.time > 1 {
+        let mut probe = vec![0u8; key_len];
+        let started = Instant::now();
+        run(1, &mut probe)?;
+        let measured = started.elapsed();
+
+        let projected_nanos = measured.as_nanos().saturating_mul(u128::from(p.time));
+        let projected = Duration::from_nanos(u64::try_from(projected_nanos).unwrap_or(u64::MAX));
+
+        if projected > DERIVATION_BUDGET {
+            return Err(LuksError::DerivationBudgetExceeded {
+                iterations: p.time,
+                projected_secs: projected.as_secs(),
+                budget_secs: DERIVATION_BUDGET.as_secs(),
+            });
+        }
+    }
+
+    let mut out = vec![0u8; key_len];
+    run(p.time, &mut out)?;
     Ok(out)
 }
 
@@ -328,6 +386,80 @@ mod tests {
             derive_key("md5", b"x", b"y", 1, 16),
             Err(LuksError::Unsupported { what: "hash", .. })
         ));
+    }
+
+    /// The LUKS2 keyslot names its own Argon2 memory cost, and `argon2::Params`
+    /// caps `m_cost` at `u32::MAX` **1 KiB blocks** — 4 TiB. Attempting the
+    /// allocation *is* the harm, so unlike the PBKDF2 iteration count this
+    /// cannot be bounded by wall clock: there is no point at which to notice.
+    #[test]
+    fn absurd_argon2_memory_is_refused_before_allocating() {
+        let p = Argon2Params {
+            kind: "argon2id",
+            time: 1,
+            memory: u32::MAX, // 4 TiB in KiB blocks
+            cpus: 1,
+            salt: &[0x11u8; 16],
+        };
+        let err = derive_key_argon2(&p, b"pw", 64)
+            .expect_err("a 4 TiB memory cost must be refused, not attempted");
+        assert!(
+            matches!(err, LuksError::DerivationMemoryExceeded { .. }),
+            "refused for the wrong reason: {err}"
+        );
+        // The refusal has to name the offending value, not just decline: an
+        // examiner needs to see which cost the header asked for.
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&u32::MAX.to_string()),
+            "value not named: {msg}"
+        );
+    }
+
+    /// The time cost is the Argon2 analogue of the PBKDF2 iteration count and is
+    /// bounded the same way — measure one pass, project, refuse over budget.
+    #[test]
+    fn absurd_argon2_time_is_refused_rather_than_run() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let p = Argon2Params {
+                kind: "argon2id",
+                time: u32::MAX,
+                memory: 64,
+                cpus: 1,
+                salt: &[0x11u8; 16],
+            };
+            let budgeted = matches!(
+                derive_key_argon2(&p, b"pw", 64),
+                Err(LuksError::DerivationBudgetExceeded { .. })
+            );
+            let _ = tx.send(budgeted);
+        });
+
+        let refused = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("derive_key_argon2 did not return within 60s for u32::MAX time cost");
+        assert!(refused, "u32::MAX time cost must be refused");
+    }
+
+    /// A cost a real LUKS2 container asks for must pass untouched. cryptsetup
+    /// writes single-digit time costs over tens-to-hundreds of MiB, so this has
+    /// to derive normally and reproducibly.
+    #[test]
+    fn a_realistic_argon2_cost_still_derives() {
+        let p = Argon2Params {
+            kind: "argon2id",
+            time: 4,
+            memory: 65_536, // 64 MiB
+            cpus: 1,
+            salt: &[0x11u8; 16],
+        };
+        let k = derive_key_argon2(&p, b"pw", 64).unwrap();
+        assert_eq!(k.len(), 64);
+        assert_eq!(k, derive_key_argon2(&p, b"pw", 64).unwrap());
     }
 
     #[test]
