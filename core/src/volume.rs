@@ -174,7 +174,7 @@ fn recover_master_key1<R: Read + Seek>(
             slot.iterations,
             key_bytes,
         )?;
-        let material_len = af::material_len(key_bytes, slot.stripes as usize);
+        let material_len = af::material_len(key_bytes, slot.stripes as usize)?;
         let mut material = vec![0u8; material_len];
         reader.seek(SeekFrom::Start(
             u64::from(slot.key_material_offset) * SECTOR,
@@ -237,7 +237,7 @@ fn recover_master_key2<R: Read + Seek>(
         };
 
         let (_, area_mode) = split_encryption(&slot.area_encryption);
-        let material_len = af::material_len(slot.key_size, slot.af_stripes as usize);
+        let material_len = af::material_len(slot.key_size, slot.af_stripes as usize)?;
         let mut material = vec![0u8; material_len];
         reader.seek(SeekFrom::Start(slot.area_offset))?;
         if read_available(reader, &mut material)? < material_len {

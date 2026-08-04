@@ -74,6 +74,16 @@ pub fn merge(
     block_size: usize,
     stripes: usize,
 ) -> Result<Vec<u8>> {
+    // `merge` is re-exported as the public `af_merge`, so it cannot assume a
+    // caller reached it through `material_len`: the loop below runs
+    // `stripes - 1` times whatever the material length says.
+    if stripes > MAX_STRIPES {
+        return Err(LuksError::ImplausibleStripes {
+            stripes,
+            max: MAX_STRIPES,
+            block_size,
+        });
+    }
     match hash_spec {
         "sha1" => Ok(af_merge::<Sha1>(material, block_size, stripes)),
         "sha256" => Ok(af_merge::<Sha256>(material, block_size, stripes)),
@@ -85,12 +95,39 @@ pub fn merge(
     }
 }
 
+/// Ceiling on the anti-forensic stripe count a keyslot may declare.
+///
+/// LUKS1 fixes the count at 4000 and cryptsetup writes the same for LUKS2, so
+/// this leaves two orders of magnitude of headroom over anything genuine while
+/// keeping both the key-material allocation and the merge loop bounded.
+pub const MAX_STRIPES: usize = 1 << 20;
+
 /// The size in bytes of the AF key material for a key of `block_size` split into
 /// `stripes` (rounded up to the 512-byte sector, as LUKS stores it).
-#[must_use]
-pub fn material_len(block_size: usize, stripes: usize) -> usize {
-    let raw = block_size * stripes;
-    raw.div_ceil(512) * 512
+///
+/// Fallible because `stripes` comes from the header: the product is the size of
+/// a buffer the caller allocates, so an implausible count has to be refused here
+/// rather than turned into an allocation request.
+///
+/// # Errors
+/// [`LuksError::ImplausibleStripes`] above [`MAX_STRIPES`], or if the product
+/// would overflow.
+pub fn material_len(block_size: usize, stripes: usize) -> Result<usize> {
+    if stripes > MAX_STRIPES {
+        return Err(LuksError::ImplausibleStripes {
+            stripes,
+            max: MAX_STRIPES,
+            block_size,
+        });
+    }
+    let raw = block_size
+        .checked_mul(stripes)
+        .ok_or(LuksError::ImplausibleStripes {
+            stripes,
+            max: MAX_STRIPES,
+            block_size,
+        })?;
+    Ok(raw.div_ceil(512) * 512)
 }
 
 /// Split `master` into `stripes` blocks with deterministic `filler`, the inverse

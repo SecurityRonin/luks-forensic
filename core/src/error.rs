@@ -55,6 +55,29 @@ pub enum LuksError {
         budget_secs: u64,
     },
 
+    /// The keyslot's anti-forensic stripe count is not plausible.
+    ///
+    /// `stripes` is a header field, so the container chooses it. It multiplies
+    /// the key size to give the key-material length the caller then allocates,
+    /// and it is the trip count of the AF merge loop — so an unbounded value is
+    /// both an allocation and a spin, on the container's say-so.
+    ///
+    /// LUKS1 fixes the count at 4000 and cryptsetup writes the same for LUKS2,
+    /// so the ceiling sits far above anything genuine.
+    #[error(
+        "keyslot declares {stripes} anti-forensic stripes, over the {max} ceiling \
+         — refusing before sizing a {} byte buffer",
+        .stripes.saturating_mul(*.block_size)
+    )]
+    ImplausibleStripes {
+        /// The stripe count the header asked for, verbatim.
+        stripes: usize,
+        /// The ceiling that was exceeded.
+        max: usize,
+        /// The key size the count would have been multiplied by.
+        block_size: usize,
+    },
+
     /// The Argon2 keyslot demands more memory than the ceiling allows.
     ///
     /// Separate from [`Self::DerivationBudgetExceeded`] because memory cannot be
