@@ -647,8 +647,8 @@ mod tests {
     /// `ceil(dkLen / 32)` HMAC blocks per iteration. A LUKS1 header asking for
     /// 0x10101010 bytes (~257 MB) therefore costs ~8.4M blocks per iteration.
     ///
-    /// The calibration probe is the sharp edge: it runs at CALIBRATION_ITERS
-    /// (20_000) and at the REQUESTED key length, so it alone is ~1.7e11
+    /// The calibration probe is the sharp edge: it runs at `CALIBRATION_ITERS`
+    /// (20 thousand) and at the REQUESTED key length, so it alone is ~1.7e11
     /// HMAC-SHA256 operations. The thing that exists to measure the cost cheaply
     /// becomes the cost. `derive_key_argon2_within` already states this rule for
     /// its memory ceiling — "the measurement must itself be safe" — and enforces
