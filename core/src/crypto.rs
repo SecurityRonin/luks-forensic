@@ -96,6 +96,16 @@ pub fn derive_key_within(
     key_len: usize,
     budget: Duration,
 ) -> Result<Vec<u8>> {
+    // Before anything allocates or measures. The calibration probe below runs at
+    // this very length, so an unbounded key_len would make the measurement
+    // itself the denial of service and neither budget could ever be consulted.
+    if key_len > MAX_KEY_BYTES {
+        return Err(LuksError::KeyLengthExceeded {
+            requested: key_len,
+            max: MAX_KEY_BYTES,
+        });
+    }
+
     let mut out = vec![0u8; key_len];
     let iters = iterations.max(1);
 
@@ -146,6 +156,20 @@ pub struct Argon2Params<'a> {
 /// LUKS2 keyslots to at most about 1 GiB, so 4 GiB is generous headroom over
 /// anything a genuine container asks for.
 const MAX_ARGON2_MEMORY_KIB: u32 = 4 * 1024 * 1024;
+
+/// Ceiling on the master-key length a header may ask a KDF to derive, in bytes.
+///
+/// The third attacker-chosen cost axis, alongside the iteration count and the
+/// Argon2 memory cost. `key_bytes` is a `u32` read straight from the header, and
+/// it scales every PBKDF2 iteration by `ceil(dkLen / hLen)` HMAC blocks as well
+/// as sizing an allocation, so it needs a ceiling of ours for the same reason
+/// [`MAX_ARGON2_MEMORY_KIB`] does.
+///
+/// 1 KiB is generous: the largest master key any real LUKS cipher uses is 64
+/// bytes (AES-256-XTS, two 256-bit keys), so this leaves 16x headroom over
+/// anything a genuine container asks for while keeping the worst case at 32 HMAC
+/// blocks per iteration instead of 8.4 million.
+const MAX_KEY_BYTES: usize = 1024;
 
 /// Derive `key_len` bytes with Argon2 (LUKS2 keyslot KDF), within `budget`.
 ///
@@ -202,6 +226,12 @@ pub fn derive_key_argon2_within(
     };
 
     // Before anything allocates, including the calibration pass below.
+    if key_len > MAX_KEY_BYTES {
+        return Err(LuksError::KeyLengthExceeded {
+            requested: key_len,
+            max: MAX_KEY_BYTES,
+        });
+    }
     if p.memory > MAX_ARGON2_MEMORY_KIB {
         return Err(LuksError::DerivationMemoryExceeded {
             requested_kib: p.memory,
@@ -638,16 +668,19 @@ mod tests {
             DERIVATION_BUDGET,
         )
         .expect_err("an implausible master-key length must be refused");
+        let elapsed = started.elapsed();
 
         assert!(
             matches!(err, LuksError::KeyLengthExceeded { .. }),
             "expected KeyLengthExceeded, got {err:?}"
         );
+        // Hoisted above the assert on purpose: calling elapsed() inside the
+        // message would put a function call on the panic path, and that cold
+        // region shows up as an uncovered production line under the 100% gate.
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "refused only after doing the work ({:?}) — the guard must run \
-             before the calibration probe allocates and derives",
-            started.elapsed()
+            elapsed < Duration::from_secs(2),
+            "refused only after doing the work ({elapsed:?}) — the guard must \
+             run before the calibration probe allocates and derives"
         );
     }
 
