@@ -839,6 +839,104 @@ mod tests {
         assert_eq!(&buf[..], &plain[..512]);
     }
 
+    /// RED for the LUKS2 half of issue #10. `recover_master_key1` is now bounded
+    /// in aggregate; `recover_master_key2` is not. It derives once per keyslot
+    /// (Argon2 or PBKDF2) and once more per digest that references the slot,
+    /// each against its own fresh per-derivation budget — so the same
+    /// multiplication that took the `unlock` fuzz target to 1778 seconds on
+    /// LUKS1 applies here unchanged, on a header that chooses both the slot
+    /// count and each slot's cost.
+    ///
+    /// Expressed with a zero budget, like the LUKS1 twin: if any aggregate bound
+    /// exists then no derivation may start, so the test costs nothing to run.
+    #[test]
+    fn luks2_pbkdf2_unlock_is_bounded_in_aggregate_not_just_per_derivation() {
+        let master = vec![0x44u8; 64];
+        let salt = [0x88u8; 16];
+        let slot_key = derive_key("sha256", PASS, &salt, 5, 64).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let kdf = format!(
+            "{{\"type\":\"pbkdf2\",\"hash\":\"sha256\",\"iterations\":5,\"salt\":\"{}\"}}",
+            b64.encode(salt)
+        );
+        let (img, _plain) = build_luks2(&master, &slot_key, &kdf, 512);
+
+        // `DecryptedPayload` is deliberately not Debug (it holds key material),
+        // so match rather than `expect_err`.
+        match LuksVolume::unlock2_with_passphrase_within(Cursor::new(img), PASS, Duration::ZERO) {
+            Err(LuksError::UnlockBudgetExceeded { slots_tried, .. }) => assert_eq!(slots_tried, 0),
+            Err(other) => panic!("expected UnlockBudgetExceeded, got {other:?}"), // cov:unreachable: a zero budget cannot reach any other error
+            Ok(_) => panic!("a zero total budget must refuse before doing derivation work"), // cov:unreachable: unreachable while the deadline is checked before the first derive
+        }
+    }
+
+    /// The Argon2 keyslot branch needs the same aggregate bound as the PBKDF2
+    /// one. Argon2's own time projection is per-derivation, so without the
+    /// deadline a header full of Argon2 slots multiplies exactly as PBKDF2 ones
+    /// do — and the memory cap does nothing about that, it bounds the other axis.
+    #[test]
+    fn luks2_argon2_unlock_is_bounded_in_aggregate_too() {
+        let master = vec![0xC3u8; 64];
+        let salt = [0x77u8; 16];
+        let slot_key = derive_key_argon2(
+            &Argon2Params {
+                kind: "argon2id",
+                time: 1,
+                memory: 32,
+                cpus: 1,
+                salt: &salt,
+            },
+            PASS,
+            64,
+        )
+        .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let kdf = format!(
+            "{{\"type\":\"argon2id\",\"time\":1,\"memory\":32,\"cpus\":1,\"salt\":\"{}\"}}",
+            b64.encode(salt)
+        );
+        let (img, _plain) = build_luks2(&master, &slot_key, &kdf, 512);
+
+        match LuksVolume::unlock2_with_passphrase_within(Cursor::new(img), PASS, Duration::ZERO) {
+            Err(LuksError::UnlockBudgetExceeded { slots_tried, .. }) => assert_eq!(slots_tried, 0),
+            Err(other) => panic!("expected UnlockBudgetExceeded, got {other:?}"), // cov:unreachable: a zero budget cannot reach any other error
+            Ok(_) => panic!("a zero total budget must refuse before running Argon2"), // cov:unreachable: unreachable while the deadline is checked before the first derive
+        }
+    }
+
+    /// The auto-detecting entry point must carry the budget too, or a caller
+    /// that does not know the container's version silently loses the bound —
+    /// which is the whole population the fuzz target and the VFS layer come
+    /// from. Both versions are asserted, since the dispatch is where a budget
+    /// gets dropped.
+    #[test]
+    fn autodetect_unlock_within_bounds_both_versions() {
+        let (img1, _) = build_luks1(&[0x33u8; L1_KEY_BYTES as usize]);
+        match LuksVolume::unlock_with_passphrase_within(Cursor::new(img1), PASS, Duration::ZERO) {
+            Err(LuksError::UnlockBudgetExceeded { .. }) => {}
+            Err(other) => {
+                panic!("LUKS1 via autodetect: expected UnlockBudgetExceeded, got {other:?}")
+            } // cov:unreachable: a zero budget cannot reach any other error
+            Ok(_) => panic!("LUKS1 via autodetect: a zero total budget must refuse"), // cov:unreachable: unreachable while the deadline is checked before the first derive
+        }
+
+        let salt = [0x88u8; 16];
+        let slot_key = derive_key("sha256", PASS, &salt, 5, 64).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let kdf = format!(
+            "{{\"type\":\"pbkdf2\",\"hash\":\"sha256\",\"iterations\":5,\"salt\":\"{}\"}}",
+            b64.encode(salt)
+        );
+        let (img2, _) = build_luks2(&vec![0x44u8; 64], &slot_key, &kdf, 512);
+        match LuksVolume::unlock_with_passphrase_within(Cursor::new(img2), PASS, Duration::ZERO) {
+            Err(LuksError::UnlockBudgetExceeded { .. }) => {}
+            Err(other) => {
+                panic!("LUKS2 via autodetect: expected UnlockBudgetExceeded, got {other:?}")
+            } // cov:unreachable: a zero budget cannot reach any other error
+            Ok(_) => panic!("LUKS2 via autodetect: a zero total budget must refuse"), // cov:unreachable: unreachable while the deadline is checked before the first derive
+        }
+    }
+
     #[test]
     fn luks2_no_crypt_segment() {
         let json = r#"{"keyslots":{"0":{"key_size":64,
