@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/SecurityRonin/luks-forensic/compare/luks-core-v0.1.7...luks-core-v0.1.8) - 2026-08-07
+
+### Fixed
+
+- *(crypto)* GREEN - bound the master-key length before allocating or calibrating
+- *(luks2)* GREEN - bound a LUKS2 unlock in aggregate, closing #10
+- *(security)* bound an unlock in aggregate, not just per derivation ([#10](https://github.com/SecurityRonin/luks-forensic/pull/10))
+
 ## [0.1.7](https://github.com/SecurityRonin/luks-forensic/compare/luks-core-v0.1.6...luks-core-v0.1.7) - 2026-08-05
 
 ### Fixed
