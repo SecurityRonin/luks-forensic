@@ -12,12 +12,17 @@ use std::time::{Duration, Instant};
 
 use crate::error::{LuksError, Result};
 
-/// Wall-clock ceiling for a single PBKDF2 derivation.
+/// Wall-clock ceiling for a SINGLE derivation.
 ///
 /// A LUKS keyslot names its own iteration count, so the work is chosen by the
 /// container rather than by us. Real ones are cheap — cryptsetup calibrates to
 /// roughly a second — so a budget an order of magnitude above that refuses
 /// hostile headers without ever getting in a genuine container's way.
+///
+/// Applied by `UnlockDeadline::remaining`, which hands out
+/// `min(time left, DERIVATION_BUDGET)`. Both ceilings then hold at once: no
+/// single derivation may run for the whole [`UNLOCK_BUDGET`], and no sequence of
+/// them may exceed it.
 pub const DERIVATION_BUDGET: Duration = Duration::from_secs(30);
 
 /// Total budget for one unlock, across every keyslot it tries.
@@ -55,13 +60,19 @@ fn pbkdf2_into(
     Ok(())
 }
 
-/// Derive `key_len` bytes with PBKDF2-HMAC-`hash_spec`.
+/// Derive `key_len` bytes with PBKDF2-HMAC-`hash_spec`, within `budget`.
 ///
-/// Costs above [`DERIVATION_BUDGET`] are refused before the work starts. The
-/// bound is on projected wall-clock rather than on the iteration count itself,
-/// because "too many rounds" is a property of the machine doing the work, not a
-/// number that can be fixed in advance — and a count that is absurd on a laptop
-/// may be routine on a workstation.
+/// The budget is a parameter rather than a default because there is no correct
+/// default: a caller running several derivations in sequence must pass the time
+/// REMAINING in its own total, or the sum goes unbounded however sound each
+/// individual check is (issue #10). Making it mandatory means no unbudgeted
+/// derivation path exists to reach for by accident.
+///
+/// Costs above `budget` are refused before the work starts. The bound is on
+/// projected wall-clock rather than on the iteration count itself, because "too
+/// many rounds" is a property of the machine doing the work, not a number that
+/// can be fixed in advance — and a count that is absurd on a laptop may be
+/// routine on a workstation.
 ///
 /// The projection comes from timing a short [`CALIBRATION_ITERS`] run and scaling
 /// it: PBKDF2 is exactly linear in its iteration count, so the estimate is sound.
@@ -77,32 +88,6 @@ fn pbkdf2_into(
 /// # Errors
 /// [`LuksError::Unsupported`] for a hash spec with no implementation;
 /// [`LuksError::DerivationBudgetExceeded`] when the projected cost is over budget.
-pub fn derive_key(
-    hash_spec: &str,
-    password: &[u8],
-    salt: &[u8],
-    iterations: u32,
-    key_len: usize,
-) -> Result<Vec<u8>> {
-    derive_key_within(
-        hash_spec,
-        password,
-        salt,
-        iterations,
-        key_len,
-        DERIVATION_BUDGET,
-    )
-}
-
-/// [`derive_key`] against an explicit budget.
-///
-/// Callers that run several derivations in sequence pass the time REMAINING in
-/// their own budget, so the projection is checked against what is actually left
-/// rather than against a fresh 30s each time.
-///
-/// # Errors
-/// [`LuksError::DerivationBudgetExceeded`] when the projected cost exceeds
-/// `budget`.
 pub fn derive_key_within(
     hash_spec: &str,
     password: &[u8],
@@ -162,30 +147,48 @@ pub struct Argon2Params<'a> {
 /// anything a genuine container asks for.
 const MAX_ARGON2_MEMORY_KIB: u32 = 4 * 1024 * 1024;
 
-/// Derive `key_len` bytes with Argon2 (LUKS2 keyslot KDF).
+/// Derive `key_len` bytes with Argon2 (LUKS2 keyslot KDF), within `budget`.
 ///
 /// Both cost axes come from the keyslot and are therefore attacker-chosen, and
 /// they need different treatment:
 ///
-/// * **Memory** is capped outright. It cannot be bounded by wall clock the way
-///   the time cost is, because *attempting* an oversized allocation is itself
-///   the harm — a `u32::MAX` memory cost gets the process killed by the OS
-///   before any deadline could fire (observed: SIGKILL, not a slow return).
+/// * **Memory** is capped outright by [`MAX_ARGON2_MEMORY_KIB`]. It cannot be
+///   bounded by wall clock the way the time cost is, because *attempting* an
+///   oversized allocation is itself the harm — a `u32::MAX` memory cost gets the
+///   process killed by the OS before any deadline could fire (observed: SIGKILL,
+///   not a slow return).
 /// * **Time** is the Argon2 analogue of the PBKDF2 iteration count and is
 ///   bounded the same way: one pass is measured, the total projected, and the
-///   whole derivation refused if it would exceed [`DERIVATION_BUDGET`]. Argon2
-///   is linear in `t_cost`, so scaling a single pass is sound.
+///   whole derivation refused if it would exceed `budget`. Argon2 is linear in
+///   `t_cost`, so scaling a single pass is sound.
 ///
 /// The calibration pass runs at the requested memory cost, which is why the
 /// memory ceiling is enforced first: the measurement must itself be safe.
 /// Calibrating costs one extra pass out of `t_cost`, so the overhead shrinks as
 /// the input gets more hostile and is at worst a doubling at `t_cost = 2`.
 ///
+/// What `budget` does and does not bound, stated plainly because the difference
+/// decides how much a hostile header can still cost: it REFUSES a derivation
+/// whose projected cost exceeds the budget. It does not INTERRUPT one already
+/// running. A single Argon2 pass has no cancellation point short of hand-rolling
+/// the KDF around the compression function, which this module will not do. So
+/// the residual exposure is one uninterruptible pass, and the memory ceiling is
+/// the only thing bounding it — including for a `t_cost` of 1, which skips
+/// calibration entirely because there is nothing to project from. A caller's
+/// aggregate deadline still decides whether the NEXT slot may start, which is
+/// what stops eight of them from multiplying.
+///
 /// # Errors
 /// [`LuksError::Unsupported`] for an unknown Argon2 variant or invalid params;
 /// [`LuksError::DerivationMemoryExceeded`] over the memory ceiling;
-/// [`LuksError::DerivationBudgetExceeded`] when the projected time is over budget.
-pub fn derive_key_argon2(p: &Argon2Params, password: &[u8], key_len: usize) -> Result<Vec<u8>> {
+/// [`LuksError::DerivationBudgetExceeded`] when the projected time exceeds
+/// `budget`.
+pub fn derive_key_argon2_within(
+    p: &Argon2Params,
+    password: &[u8],
+    key_len: usize,
+    budget: Duration,
+) -> Result<Vec<u8>> {
     use argon2::{Algorithm, Argon2, Params, Version};
     let algo = match p.kind {
         "argon2i" => Algorithm::Argon2i,
@@ -230,11 +233,11 @@ pub fn derive_key_argon2(p: &Argon2Params, password: &[u8], key_len: usize) -> R
         let projected_nanos = measured.as_nanos().saturating_mul(u128::from(p.time));
         let projected = Duration::from_nanos(u64::try_from(projected_nanos).unwrap_or(u64::MAX));
 
-        if projected > DERIVATION_BUDGET {
+        if projected > budget {
             return Err(LuksError::DerivationBudgetExceeded {
                 iterations: p.time,
                 projected_secs: projected.as_secs(),
-                budget_secs: DERIVATION_BUDGET.as_secs(),
+                budget_secs: budget.as_secs(),
             });
         }
     }
@@ -320,7 +323,14 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let r = derive_key("sha1", b"luks-TEST", b"salt", u32::MAX, 32);
+            let r = derive_key_within(
+                "sha1",
+                b"luks-TEST",
+                b"salt",
+                u32::MAX,
+                32,
+                DERIVATION_BUDGET,
+            );
             // Assert the *reason*, not merely that something failed: an
             // is_err() check would pass just as happily on an unrelated error
             // and prove nothing about the budget.
@@ -350,17 +360,34 @@ mod tests {
     /// go through untouched and produce the same key as an unbudgeted run.
     #[test]
     fn a_realistic_iteration_count_still_derives() {
-        let k = derive_key("sha256", b"password", b"salt", 200_000, 32).unwrap();
+        let k = derive_key_within(
+            "sha256",
+            b"password",
+            b"salt",
+            200_000,
+            32,
+            DERIVATION_BUDGET,
+        )
+        .unwrap();
         assert_eq!(k.len(), 32);
         // Same input, same key — the budget check must not perturb the result.
-        let again = derive_key("sha256", b"password", b"salt", 200_000, 32).unwrap();
+        let again = derive_key_within(
+            "sha256",
+            b"password",
+            b"salt",
+            200_000,
+            32,
+            DERIVATION_BUDGET,
+        )
+        .unwrap();
         assert_eq!(k, again);
     }
 
     #[test]
     fn derive_key_matches_known_pbkdf2_sha256() {
         // PBKDF2-HMAC-SHA256("password","salt",1,32) — cross-checked vs Python.
-        let k = derive_key("sha256", b"password", b"salt", 1, 32).unwrap();
+        let k =
+            derive_key_within("sha256", b"password", b"salt", 1, 32, DERIVATION_BUDGET).unwrap();
         assert_eq!(
             hex(&k),
             "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
@@ -419,7 +446,7 @@ mod tests {
     #[test]
     fn derive_key_rejects_unknown_hash() {
         assert!(matches!(
-            derive_key("md5", b"x", b"y", 1, 16),
+            derive_key_within("md5", b"x", b"y", 1, 16, DERIVATION_BUDGET),
             Err(LuksError::Unsupported { what: "hash", .. })
         ));
     }
@@ -437,7 +464,7 @@ mod tests {
             cpus: 1,
             salt: &[0x11u8; 16],
         };
-        let err = derive_key_argon2(&p, b"pw", 64)
+        let err = derive_key_argon2_within(&p, b"pw", 64, DERIVATION_BUDGET)
             .expect_err("a 4 TiB memory cost must be refused, not attempted");
         assert!(
             matches!(err, LuksError::DerivationMemoryExceeded { .. }),
@@ -469,7 +496,7 @@ mod tests {
                 salt: &[0x11u8; 16],
             };
             let budgeted = matches!(
-                derive_key_argon2(&p, b"pw", 64),
+                derive_key_argon2_within(&p, b"pw", 64, DERIVATION_BUDGET),
                 Err(LuksError::DerivationBudgetExceeded { .. })
             );
             let _ = tx.send(budgeted);
@@ -493,9 +520,12 @@ mod tests {
             cpus: 1,
             salt: &[0x11u8; 16],
         };
-        let k = derive_key_argon2(&p, b"pw", 64).unwrap();
+        let k = derive_key_argon2_within(&p, b"pw", 64, DERIVATION_BUDGET).unwrap();
         assert_eq!(k.len(), 64);
-        assert_eq!(k, derive_key_argon2(&p, b"pw", 64).unwrap());
+        assert_eq!(
+            k,
+            derive_key_argon2_within(&p, b"pw", 64, DERIVATION_BUDGET).unwrap()
+        );
     }
 
     #[test]
@@ -507,14 +537,14 @@ mod tests {
             cpus: 1,
             salt: &[0x11u8; 16],
         };
-        let k = derive_key_argon2(&p, b"pw", 64).unwrap();
+        let k = derive_key_argon2_within(&p, b"pw", 64, DERIVATION_BUDGET).unwrap();
         assert_eq!(k.len(), 64);
         let bad = Argon2Params {
             kind: "scrypt",
             ..p
         };
         assert!(matches!(
-            derive_key_argon2(&bad, b"pw", 64),
+            derive_key_argon2_within(&bad, b"pw", 64, DERIVATION_BUDGET),
             Err(LuksError::Unsupported {
                 what: "argon2 variant",
                 ..
@@ -549,7 +579,7 @@ mod tests {
             salt: &[0x11u8; 16],
         };
         assert!(matches!(
-            derive_key_argon2(&p, b"pw", 32),
+            derive_key_argon2_within(&p, b"pw", 32, DERIVATION_BUDGET),
             Err(LuksError::Unsupported {
                 what: "argon2 params",
                 ..
@@ -569,7 +599,7 @@ mod tests {
             salt: &[0u8; 4],
         };
         assert!(matches!(
-            derive_key_argon2(&p, b"pw", 32),
+            derive_key_argon2_within(&p, b"pw", 32, DERIVATION_BUDGET),
             Err(LuksError::Unsupported { what: "argon2", .. })
         ));
     }

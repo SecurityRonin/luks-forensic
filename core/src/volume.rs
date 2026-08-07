@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use crate::af;
 use crate::crypto::{
-    derive_key, derive_key_argon2, derive_key_within, xts_decrypt_area, Argon2Params, UNLOCK_BUDGET,
+    derive_key_argon2_within, derive_key_within, xts_decrypt_area, Argon2Params, DERIVATION_BUDGET,
+    UNLOCK_BUDGET,
 };
 use crate::error::{LuksError, Result};
 use crate::header::{Luks1Header, LUKS1_PHDR_LEN, MK_DIGEST_LEN, SECTOR};
@@ -50,16 +51,34 @@ impl LuksVolume {
     /// # Errors
     /// See [`Self::unlock1_with_passphrase`] / [`Self::unlock2_with_passphrase`].
     pub fn unlock_with_passphrase<R: Read + Seek>(
+        reader: R,
+        passphrase: &[u8],
+    ) -> Result<DecryptedPayload<R>> {
+        Self::unlock_with_passphrase_within(reader, passphrase, UNLOCK_BUDGET)
+    }
+
+    /// [`Self::unlock_with_passphrase`] against an explicit TOTAL budget.
+    ///
+    /// The auto-detecting entry point carries the budget too, because the
+    /// callers that do not know a container's version up front — the VFS layer,
+    /// the fuzz target, a triage sweep over an image — are exactly the ones that
+    /// must not silently lose the bound at the version dispatch.
+    ///
+    /// # Errors
+    /// [`LuksError::UnlockBudgetExceeded`] when the total runs out, plus
+    /// everything [`Self::unlock_with_passphrase`] returns.
+    pub fn unlock_with_passphrase_within<R: Read + Seek>(
         mut reader: R,
         passphrase: &[u8],
+        budget: Duration,
     ) -> Result<DecryptedPayload<R>> {
         let mut ver = [0u8; 8];
         reader.seek(SeekFrom::Start(0))?;
         read_fill(&mut reader, &mut ver)?;
         reader.seek(SeekFrom::Start(0))?;
         match crate::bytes::be_u16(&ver, 6) {
-            1 => Self::unlock1_with_passphrase(reader, passphrase),
-            2 => Self::unlock2_with_passphrase(reader, passphrase),
+            1 => Self::unlock1_with_passphrase_within(reader, passphrase, budget),
+            2 => Self::unlock2_with_passphrase_within(reader, passphrase, budget),
             other => {
                 if ver.starts_with(&crate::header::LUKS_MAGIC) {
                     Err(LuksError::UnsupportedVersion { version: other })
@@ -72,11 +91,6 @@ impl LuksVolume {
         }
     }
 
-    /// Unlock a LUKS1 container from `reader` with `passphrase`.
-    ///
-    /// # Errors
-    /// Header-parse errors, [`LuksError::NoActiveKeyslot`], or
-    /// [`LuksError::AuthenticationFailed`] on a wrong passphrase.
     /// [`Self::unlock1_with_passphrase`] against an explicit TOTAL budget.
     ///
     /// The budget spans every keyslot the unlock tries, not each derivation. A
@@ -94,6 +108,11 @@ impl LuksVolume {
         Self::unlock1_inner(reader, passphrase, UnlockDeadline::new(budget))
     }
 
+    /// Unlock a LUKS1 container from `reader` with `passphrase`.
+    ///
+    /// # Errors
+    /// Header-parse errors, [`LuksError::NoActiveKeyslot`], or
+    /// [`LuksError::AuthenticationFailed`] on a wrong passphrase.
     pub fn unlock1_with_passphrase<R: Read + Seek>(
         reader: R,
         passphrase: &[u8],
@@ -136,14 +155,39 @@ impl LuksVolume {
         })
     }
 
+    /// [`Self::unlock2_with_passphrase`] against an explicit TOTAL budget.
+    ///
+    /// Same bound as the LUKS1 twin, and needed for the same reason:
+    /// `recover_master_key2` derives once per keyslot plus once per digest that
+    /// references it, over a slot count and per-slot cost the header chooses.
+    ///
+    /// # Errors
+    /// [`LuksError::UnlockBudgetExceeded`] when the total runs out, plus
+    /// everything [`Self::unlock2_with_passphrase`] returns.
+    pub fn unlock2_with_passphrase_within<R: Read + Seek>(
+        reader: R,
+        passphrase: &[u8],
+        budget: Duration,
+    ) -> Result<DecryptedPayload<R>> {
+        Self::unlock2_inner(reader, passphrase, UnlockDeadline::new(budget))
+    }
+
     /// Unlock a LUKS2 container from `reader` with `passphrase`.
     ///
     /// # Errors
     /// Header/JSON-parse errors, [`LuksError::NoActiveKeyslot`] if there is no
     /// crypt segment or keyslot, or [`LuksError::AuthenticationFailed`].
     pub fn unlock2_with_passphrase<R: Read + Seek>(
+        reader: R,
+        passphrase: &[u8],
+    ) -> Result<DecryptedPayload<R>> {
+        Self::unlock2_inner(reader, passphrase, UnlockDeadline::new(UNLOCK_BUDGET))
+    }
+
+    fn unlock2_inner<R: Read + Seek>(
         mut reader: R,
         passphrase: &[u8],
+        deadline: UnlockDeadline,
     ) -> Result<DecryptedPayload<R>> {
         // Read the binary header to learn hdr_size, then the whole header+JSON.
         let mut bin = vec![0u8; LUKS2_BIN_HDR_LEN];
@@ -163,7 +207,7 @@ impl LuksVolume {
             return Err(LuksError::NoActiveKeyslot);
         }
 
-        let master_key = recover_master_key2(&mut reader, &header, passphrase)?;
+        let master_key = recover_master_key2(&mut reader, &header, passphrase, deadline)?;
         let total_size = reader.seek(SeekFrom::End(0))?;
         let (cipher_name, cipher_mode) = split_encryption(&segment.encryption);
         let key_bytes = master_key.len() as u32;
@@ -208,10 +252,17 @@ impl UnlockDeadline {
     }
 
     /// Time left, or the error naming how far the unlock got before running out.
+    ///
+    /// Clamped to [`crypto::DERIVATION_BUDGET`], so the aggregate bound does not
+    /// quietly widen the per-derivation one it was added alongside: without the
+    /// clamp a single slot could spend the entire [`crypto::UNLOCK_BUDGET`],
+    /// which is three times what one derivation was ever allowed. Both ceilings
+    /// hold together — no derivation over 30s, no unlock over 90s.
     fn remaining(self, slots_tried: usize) -> Result<Duration> {
         self.total
             .checked_sub(self.started.elapsed())
             .filter(|left| !left.is_zero())
+            .map(|left| left.min(DERIVATION_BUDGET))
             .ok_or(LuksError::UnlockBudgetExceeded {
                 slots_tried,
                 budget_secs: self.total.as_secs(),
@@ -269,12 +320,20 @@ fn recover_master_key1<R: Read + Seek>(
 
 /// LUKS2: try each keyslot (Argon2 or PBKDF2 KDF) and verify against a digest
 /// that references it.
+///
+/// `deadline` bounds the loop as a whole. Each iteration re-reads what is left
+/// before committing to any derivation, so a header cannot multiply a
+/// per-derivation budget by its own slot count. For the Argon2 branch that is
+/// the *only* bound on a slot that is already running — see
+/// [`crypto::derive_key_argon2_within`] — but it is what stops the next slot
+/// from starting, which is the multiplication this exists to prevent.
 fn recover_master_key2<R: Read + Seek>(
     reader: &mut R,
     header: &Luks2Header,
     passphrase: &[u8],
+    deadline: UnlockDeadline,
 ) -> Result<Vec<u8>> {
-    for slot in &header.keyslots {
+    for (tried, slot) in header.keyslots.iter().enumerate() {
         let slot_key = match &slot.kdf {
             Luks2Kdf::Argon2 {
                 kind,
@@ -282,7 +341,7 @@ fn recover_master_key2<R: Read + Seek>(
                 memory,
                 cpus,
                 salt,
-            } => derive_key_argon2(
+            } => derive_key_argon2_within(
                 &Argon2Params {
                     kind,
                     time: *time,
@@ -292,12 +351,20 @@ fn recover_master_key2<R: Read + Seek>(
                 },
                 passphrase,
                 slot.key_size,
+                deadline.remaining(tried)?,
             )?,
             Luks2Kdf::Pbkdf2 {
                 hash,
                 iterations,
                 salt,
-            } => derive_key(hash, passphrase, salt, *iterations, slot.key_size)?,
+            } => derive_key_within(
+                hash,
+                passphrase,
+                salt,
+                *iterations,
+                slot.key_size,
+                deadline.remaining(tried)?,
+            )?,
         };
 
         let (_, area_mode) = split_encryption(&slot.area_encryption);
@@ -317,12 +384,13 @@ fn recover_master_key2<R: Read + Seek>(
 
         for dig in &header.digests {
             if dig.kind == "pbkdf2" && dig.keyslots.iter().any(|k| k == &slot.id) {
-                let d = derive_key(
+                let d = derive_key_within(
                     &dig.hash,
                     &candidate,
                     &dig.salt,
                     dig.iterations,
                     dig.digest.len(),
+                    deadline.remaining(tried)?,
                 )?;
                 if d == dig.digest {
                     return Ok(candidate);
@@ -468,7 +536,7 @@ mod tests {
 
     use super::*;
     use crate::af;
-    use crate::crypto::{derive_key, derive_key_argon2, Argon2Params};
+    use crate::crypto::{derive_key_argon2_within, derive_key_within, Argon2Params};
     use crate::header::{
         KEYSLOT_LEN, KEY_DISABLED, KEY_ENABLED, LUKS1_PHDR_LEN, LUKS_MAGIC, LUKS_NUM_KEYS,
     };
@@ -788,7 +856,7 @@ mod tests {
     fn luks2_argon2id_roundtrip() {
         let master = vec![0xC3u8; 64];
         let salt = [0x77u8; 16];
-        let slot_key = derive_key_argon2(
+        let slot_key = derive_key_argon2_within(
             &Argon2Params {
                 kind: "argon2id",
                 time: 1,
@@ -798,6 +866,7 @@ mod tests {
             },
             PASS,
             64,
+            DERIVATION_BUDGET,
         )
         .unwrap();
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -824,7 +893,7 @@ mod tests {
     fn luks2_pbkdf2_roundtrip() {
         let master = vec![0x1Eu8; 64];
         let salt = [0x88u8; 16];
-        let slot_key = derive_key("sha256", PASS, &salt, 5, 64).unwrap();
+        let slot_key = derive_key_within("sha256", PASS, &salt, 5, 64, DERIVATION_BUDGET).unwrap();
         let b64 = base64::engine::general_purpose::STANDARD;
         let kdf = format!(
             "{{\"type\":\"pbkdf2\",\"hash\":\"sha256\",\"iterations\":5,\"salt\":\"{}\"}}",
@@ -853,7 +922,7 @@ mod tests {
     fn luks2_pbkdf2_unlock_is_bounded_in_aggregate_not_just_per_derivation() {
         let master = vec![0x44u8; 64];
         let salt = [0x88u8; 16];
-        let slot_key = derive_key("sha256", PASS, &salt, 5, 64).unwrap();
+        let slot_key = derive_key_within("sha256", PASS, &salt, 5, 64, DERIVATION_BUDGET).unwrap();
         let b64 = base64::engine::general_purpose::STANDARD;
         let kdf = format!(
             "{{\"type\":\"pbkdf2\",\"hash\":\"sha256\",\"iterations\":5,\"salt\":\"{}\"}}",
@@ -878,7 +947,7 @@ mod tests {
     fn luks2_argon2_unlock_is_bounded_in_aggregate_too() {
         let master = vec![0xC3u8; 64];
         let salt = [0x77u8; 16];
-        let slot_key = derive_key_argon2(
+        let slot_key = derive_key_argon2_within(
             &Argon2Params {
                 kind: "argon2id",
                 time: 1,
@@ -888,6 +957,7 @@ mod tests {
             },
             PASS,
             64,
+            DERIVATION_BUDGET,
         )
         .unwrap();
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -921,13 +991,13 @@ mod tests {
         }
 
         let salt = [0x88u8; 16];
-        let slot_key = derive_key("sha256", PASS, &salt, 5, 64).unwrap();
+        let slot_key = derive_key_within("sha256", PASS, &salt, 5, 64, DERIVATION_BUDGET).unwrap();
         let b64 = base64::engine::general_purpose::STANDARD;
         let kdf = format!(
             "{{\"type\":\"pbkdf2\",\"hash\":\"sha256\",\"iterations\":5,\"salt\":\"{}\"}}",
             b64.encode(salt)
         );
-        let (img2, _) = build_luks2(&vec![0x44u8; 64], &slot_key, &kdf, 512);
+        let (img2, _) = build_luks2(&[0x44u8; 64], &slot_key, &kdf, 512);
         match LuksVolume::unlock_with_passphrase_within(Cursor::new(img2), PASS, Duration::ZERO) {
             Err(LuksError::UnlockBudgetExceeded { .. }) => {}
             Err(other) => {
