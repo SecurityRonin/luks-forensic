@@ -20,6 +20,15 @@ use crate::error::{LuksError, Result};
 /// hostile headers without ever getting in a genuine container's way.
 pub const DERIVATION_BUDGET: Duration = Duration::from_secs(30);
 
+/// Total budget for one unlock, across every keyslot it tries.
+///
+/// [`DERIVATION_BUDGET`] bounds a single derivation. It cannot bound an unlock:
+/// `recover_master_key*` derives twice per active keyslot and LUKS permits 8, so
+/// a header that stays just under the per-derivation budget on every slot costs
+/// 16x it. That is how the `unlock` fuzz target reached a 1778s timeout while
+/// every individual budget check passed.
+pub const UNLOCK_BUDGET: Duration = Duration::from_secs(90);
+
 /// Iterations timed to measure this machine's PBKDF2 rate before committing to
 /// the full count. Large enough to swamp timer noise, small enough that paying
 /// it twice on the accepted path is irrelevant.
@@ -75,6 +84,33 @@ pub fn derive_key(
     iterations: u32,
     key_len: usize,
 ) -> Result<Vec<u8>> {
+    derive_key_within(
+        hash_spec,
+        password,
+        salt,
+        iterations,
+        key_len,
+        DERIVATION_BUDGET,
+    )
+}
+
+/// [`derive_key`] against an explicit budget.
+///
+/// Callers that run several derivations in sequence pass the time REMAINING in
+/// their own budget, so the projection is checked against what is actually left
+/// rather than against a fresh 30s each time.
+///
+/// # Errors
+/// [`LuksError::DerivationBudgetExceeded`] when the projected cost exceeds
+/// `budget`.
+pub fn derive_key_within(
+    hash_spec: &str,
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    key_len: usize,
+    budget: Duration,
+) -> Result<Vec<u8>> {
     let mut out = vec![0u8; key_len];
     let iters = iterations.max(1);
 
@@ -91,11 +127,11 @@ pub fn derive_key(
             measured.as_nanos().saturating_mul(u128::from(iters)) / u128::from(CALIBRATION_ITERS);
         let projected = Duration::from_nanos(u64::try_from(projected_nanos).unwrap_or(u64::MAX));
 
-        if projected > DERIVATION_BUDGET {
+        if projected > budget {
             return Err(LuksError::DerivationBudgetExceeded {
                 iterations: iters,
                 projected_secs: projected.as_secs(),
-                budget_secs: DERIVATION_BUDGET.as_secs(),
+                budget_secs: budget.as_secs(),
             });
         }
     }

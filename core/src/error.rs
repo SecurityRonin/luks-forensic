@@ -40,6 +40,25 @@ pub enum LuksError {
     ///
     /// A *refusal*, never a silent reduction: deriving with fewer rounds than the
     /// header specifies produces a different key, which would report a wrong
+    /// An unlock exhausted its TOTAL time budget across all keyslots.
+    ///
+    /// Distinct from [`Self::DerivationBudgetExceeded`], which bounds a single
+    /// derivation. LUKS permits 8 keyslots and the header decides how many are
+    /// active and what each costs, so a crafted header can stay under the
+    /// per-derivation budget on every slot while the sum runs for hours. Each
+    /// individual check passes; nothing owns the total. This variant is that
+    /// total.
+    #[error(
+        "unlock exceeded its total budget of {budget_secs}s after {slots_tried} keyslot(s); \
+         the header's cumulative key-derivation cost is not satisfiable"
+    )]
+    UnlockBudgetExceeded {
+        /// How many keyslots had been attempted when the budget ran out.
+        slots_tried: usize,
+        /// The total budget for the whole unlock.
+        budget_secs: u64,
+    },
+
     /// passphrase for a container that would in fact have opened.
     #[error(
         "key derivation would take about {projected_secs}s for {iterations} iterations, \

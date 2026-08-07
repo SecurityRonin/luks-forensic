@@ -6,9 +6,12 @@
 //! [`DecryptedPayload`] that decrypts the data segment on demand.
 
 use std::io::{Read, Seek, SeekFrom};
+use std::time::{Duration, Instant};
 
 use crate::af;
-use crate::crypto::{derive_key, derive_key_argon2, xts_decrypt_area, Argon2Params};
+use crate::crypto::{
+    derive_key, derive_key_argon2, derive_key_within, xts_decrypt_area, Argon2Params, UNLOCK_BUDGET,
+};
 use crate::error::{LuksError, Result};
 use crate::header::{Luks1Header, LUKS1_PHDR_LEN, MK_DIGEST_LEN, SECTOR};
 use crate::header2::{Luks2Header, Luks2Kdf, LUKS2_BIN_HDR_LEN};
@@ -74,9 +77,34 @@ impl LuksVolume {
     /// # Errors
     /// Header-parse errors, [`LuksError::NoActiveKeyslot`], or
     /// [`LuksError::AuthenticationFailed`] on a wrong passphrase.
+    /// [`Self::unlock1_with_passphrase`] against an explicit TOTAL budget.
+    ///
+    /// The budget spans every keyslot the unlock tries, not each derivation. A
+    /// forensic caller working through a large image may want a tighter bound
+    /// than the default; a crafted header cannot exceed whichever is given.
+    ///
+    /// # Errors
+    /// [`LuksError::UnlockBudgetExceeded`] when the total runs out, plus
+    /// everything [`Self::unlock1_with_passphrase`] returns.
+    pub fn unlock1_with_passphrase_within<R: Read + Seek>(
+        reader: R,
+        passphrase: &[u8],
+        budget: Duration,
+    ) -> Result<DecryptedPayload<R>> {
+        Self::unlock1_inner(reader, passphrase, UnlockDeadline::new(budget))
+    }
+
     pub fn unlock1_with_passphrase<R: Read + Seek>(
+        reader: R,
+        passphrase: &[u8],
+    ) -> Result<DecryptedPayload<R>> {
+        Self::unlock1_inner(reader, passphrase, UnlockDeadline::new(UNLOCK_BUDGET))
+    }
+
+    fn unlock1_inner<R: Read + Seek>(
         mut reader: R,
         passphrase: &[u8],
+        deadline: UnlockDeadline,
     ) -> Result<DecryptedPayload<R>> {
         let mut hdr_buf = vec![0u8; LUKS1_PHDR_LEN];
         reader.seek(SeekFrom::Start(0))?;
@@ -86,7 +114,8 @@ impl LuksVolume {
             return Err(LuksError::NoActiveKeyslot);
         }
         let key_bytes = header.key_bytes as usize;
-        let master_key = recover_master_key1(&mut reader, &header, passphrase, key_bytes)?;
+        let master_key =
+            recover_master_key1(&mut reader, &header, passphrase, key_bytes, deadline)?;
         let total_size = reader.seek(SeekFrom::End(0))?;
         Ok(DecryptedPayload {
             reader,
@@ -158,6 +187,38 @@ impl LuksVolume {
     }
 }
 
+/// Remaining allowance in an unlock's total budget.
+///
+/// Bounds the WHOLE unlock rather than each derivation. `recover_master_key*`
+/// derives twice per active keyslot over up to 8 attacker-chosen slots, so a
+/// per-derivation budget leaves the sum unbounded — see
+/// [`crypto::UNLOCK_BUDGET`].
+#[derive(Debug, Clone, Copy)]
+struct UnlockDeadline {
+    started: Instant,
+    total: Duration,
+}
+
+impl UnlockDeadline {
+    fn new(total: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            total,
+        }
+    }
+
+    /// Time left, or the error naming how far the unlock got before running out.
+    fn remaining(self, slots_tried: usize) -> Result<Duration> {
+        self.total
+            .checked_sub(self.started.elapsed())
+            .filter(|left| !left.is_zero())
+            .ok_or(LuksError::UnlockBudgetExceeded {
+                slots_tried,
+                budget_secs: self.total.as_secs(),
+            })
+    }
+}
+
 /// LUKS1: try each active keyslot until one yields a master key whose digest
 /// matches.
 fn recover_master_key1<R: Read + Seek>(
@@ -165,14 +226,16 @@ fn recover_master_key1<R: Read + Seek>(
     header: &Luks1Header,
     passphrase: &[u8],
     key_bytes: usize,
+    deadline: UnlockDeadline,
 ) -> Result<Vec<u8>> {
-    for slot in header.active_keyslots() {
-        let slot_key = derive_key(
+    for (tried, slot) in header.active_keyslots().enumerate() {
+        let slot_key = derive_key_within(
             &header.hash_spec,
             passphrase,
             &slot.salt,
             slot.iterations,
             key_bytes,
+            deadline.remaining(tried)?,
         )?;
         let material_len = af::material_len(key_bytes, slot.stripes as usize)?;
         let mut material = vec![0u8; material_len];
@@ -189,12 +252,13 @@ fn recover_master_key1<R: Read + Seek>(
             key_bytes,
             slot.stripes as usize,
         )?; // cov:unreachable: hash_spec already validated by the slot-key derive_key above
-        let digest = derive_key(
+        let digest = derive_key_within(
             &header.hash_spec,
             &candidate,
             &header.mk_digest_salt,
             header.mk_digest_iter,
             MK_DIGEST_LEN,
+            deadline.remaining(tried)?,
         )?; // cov:unreachable: hash_spec already validated by the slot-key derive_key above
         if digest == header.mk_digest {
             return Ok(candidate);
@@ -400,6 +464,8 @@ mod tests {
     //! back. These are Tier-3 self-consistency scaffolding — the real correctness
     //! proof is the `cryptsetup` oracle (`tests/oracle_luks{1,2}.rs`).
 
+    use std::time::Duration;
+
     use super::*;
     use crate::af;
     use crate::crypto::{derive_key, derive_key_argon2, Argon2Params};
@@ -558,6 +624,29 @@ mod tests {
         let mut vol = LuksVolume::unlock1_with_passphrase(Cursor::new(img), PASS).unwrap();
         assert!(vol.seek(SeekFrom::Start(0)).is_ok());
         assert!(vol.seek(SeekFrom::Current(-1)).is_err());
+    }
+
+    /// RED for the fuzz timeout (issue #10). `DERIVATION_BUDGET` bounds ONE
+    /// derivation at 30s, but `recover_master_key1` calls `derive_key` twice per
+    /// active keyslot and LUKS permits 8 of them — all attacker-controlled. Each
+    /// call passes its own budget while the total is unbounded, which is how the
+    /// `unlock` fuzz target reached a 1778-second timeout.
+    ///
+    /// The invariant: an unlock must be bounded as a WHOLE, not per derivation.
+    /// Expressed with a zero budget so the test costs nothing to run — if any
+    /// aggregate bound exists, no derivation may start.
+    #[test]
+    fn unlock_is_bounded_in_aggregate_not_just_per_derivation() {
+        let master = [0x33u8; L1_KEY_BYTES as usize];
+        let (img, _plain) = build_luks1(&master);
+
+        // `DecryptedPayload` is deliberately not Debug (it holds key material),
+        // so match rather than `expect_err`.
+        match LuksVolume::unlock1_with_passphrase_within(Cursor::new(img), PASS, Duration::ZERO) {
+            Err(LuksError::UnlockBudgetExceeded { .. }) => {}
+            Err(other) => panic!("expected UnlockBudgetExceeded, got {other:?}"), // cov:unreachable: a zero budget cannot reach any other error
+            Ok(_) => panic!("a zero total budget must refuse before doing derivation work"), // cov:unreachable: unreachable while the deadline is checked before the first derive
+        }
     }
 
     #[test]
