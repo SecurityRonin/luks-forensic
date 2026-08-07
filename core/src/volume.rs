@@ -984,10 +984,8 @@ mod tests {
         let (img1, _) = build_luks1(&[0x33u8; L1_KEY_BYTES as usize]);
         match LuksVolume::unlock_with_passphrase_within(Cursor::new(img1), PASS, Duration::ZERO) {
             Err(LuksError::UnlockBudgetExceeded { .. }) => {}
-            Err(other) => {
-                panic!("LUKS1 via autodetect: expected UnlockBudgetExceeded, got {other:?}")
-            } // cov:unreachable: a zero budget cannot reach any other error
-            Ok(_) => panic!("LUKS1 via autodetect: a zero total budget must refuse"), // cov:unreachable: unreachable while the deadline is checked before the first derive
+            Err(other) => panic!("LUKS1: expected UnlockBudgetExceeded, got {other:?}"), // cov:unreachable: a zero budget cannot reach any other error
+            Ok(_) => panic!("LUKS1: a zero total budget must refuse"), // cov:unreachable: unreachable while the deadline is checked before the first derive
         }
 
         let salt = [0x88u8; 16];
@@ -1000,10 +998,8 @@ mod tests {
         let (img2, _) = build_luks2(&[0x44u8; 64], &slot_key, &kdf, 512);
         match LuksVolume::unlock_with_passphrase_within(Cursor::new(img2), PASS, Duration::ZERO) {
             Err(LuksError::UnlockBudgetExceeded { .. }) => {}
-            Err(other) => {
-                panic!("LUKS2 via autodetect: expected UnlockBudgetExceeded, got {other:?}")
-            } // cov:unreachable: a zero budget cannot reach any other error
-            Ok(_) => panic!("LUKS2 via autodetect: a zero total budget must refuse"), // cov:unreachable: unreachable while the deadline is checked before the first derive
+            Err(other) => panic!("LUKS2: expected UnlockBudgetExceeded, got {other:?}"), // cov:unreachable: a zero budget cannot reach any other error
+            Ok(_) => panic!("LUKS2: a zero total budget must refuse"), // cov:unreachable: unreachable while the deadline is checked before the first derive
         }
     }
 
@@ -1100,6 +1096,26 @@ mod tests {
         assert!(matches!(
             LuksVolume::unlock2_with_passphrase(Cursor::new(img), PASS),
             Err(LuksError::Unsupported { .. })
+        ));
+    }
+
+    /// The PBKDF2 keyslot branch's own error propagation, which the Argon2 branch
+    /// has (`luks2_bad_argon2_params_errors`) and this one did not: an
+    /// unsupported hash in the SLOT's KDF, distinct from the AF hash and the
+    /// digest hash the neighbouring tests cover. Fails at the first derivation,
+    /// before any key material is read.
+    #[test]
+    fn luks2_unsupported_keyslot_kdf_hash_errors() {
+        let json = r#"{"keyslots":{"0":{"key_size":64,
+          "af":{"stripes":8,"hash":"sha256"},
+          "area":{"offset":"8192","size":"512","encryption":"aes-xts-plain64"},
+          "kdf":{"type":"pbkdf2","hash":"md5","iterations":5,"salt":"AAAA"}}},
+          "segments":{"0":{"type":"crypt","offset":"12288","encryption":"aes-xts-plain64","sector_size":512}},
+          "digests":{}}"#;
+        let img = build_luks2_json(json);
+        assert!(matches!(
+            LuksVolume::unlock2_with_passphrase(Cursor::new(img), PASS),
+            Err(LuksError::Unsupported { what: "hash", .. })
         ));
     }
 
