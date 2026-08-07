@@ -611,4 +611,71 @@ mod tests {
             s
         })
     }
+
+    /// The master-key length is a header field, so it is attacker-chosen, and it
+    /// multiplies the work of EVERY PBKDF2 call: dkLen bytes cost
+    /// `ceil(dkLen / 32)` HMAC blocks per iteration. A LUKS1 header asking for
+    /// 0x10101010 bytes (~257 MB) therefore costs ~8.4M blocks per iteration.
+    ///
+    /// The calibration probe is the sharp edge: it runs at CALIBRATION_ITERS
+    /// (20_000) and at the REQUESTED key length, so it alone is ~1.7e11
+    /// HMAC-SHA256 operations. The thing that exists to measure the cost cheaply
+    /// becomes the cost. `derive_key_argon2_within` already states this rule for
+    /// its memory ceiling — "the measurement must itself be safe" — and enforces
+    /// it before allocating; this is the same rule applied to the other axis.
+    ///
+    /// The elapsed-time assertion is the point of the test: a guard that refuses
+    /// AFTER doing the work would still return the right error.
+    #[test]
+    fn derive_key_refuses_an_implausible_key_length_before_calibrating() {
+        let started = Instant::now();
+        let err = derive_key_within(
+            "sha256",
+            b"luks-TEST",
+            &[0u8; 32],
+            50_000,
+            0x1010_1010, // the value from the fuzz timeout artifact
+            DERIVATION_BUDGET,
+        )
+        .expect_err("an implausible master-key length must be refused");
+
+        assert!(
+            matches!(err, LuksError::KeyLengthExceeded { .. }),
+            "expected KeyLengthExceeded, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "refused only after doing the work ({:?}) — the guard must run \
+             before the calibration probe allocates and derives",
+            started.elapsed()
+        );
+    }
+
+    /// Same ceiling on the Argon2 path: `key_len` there is equally header-chosen.
+    #[test]
+    fn derive_key_argon2_refuses_an_implausible_key_length() {
+        let p = Argon2Params {
+            kind: "argon2id",
+            time: 1,
+            memory: 32,
+            cpus: 1,
+            salt: &[0u8; 16],
+        };
+        assert!(matches!(
+            derive_key_argon2_within(&p, b"pw", 0x1010_1010, DERIVATION_BUDGET),
+            Err(LuksError::KeyLengthExceeded { .. })
+        ));
+    }
+
+    /// The ceiling must not reject anything real: AES-256-XTS uses a 64-byte
+    /// master key, the largest any LUKS cipher asks for.
+    #[test]
+    fn real_master_key_lengths_are_still_accepted() {
+        for len in [16usize, 32, 64] {
+            assert!(
+                derive_key_within("sha256", b"pw", &[0u8; 32], 1, len, DERIVATION_BUDGET).is_ok(),
+                "a {len}-byte master key is ordinary and must still derive"
+            );
+        }
+    }
 }

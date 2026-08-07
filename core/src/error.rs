@@ -116,6 +116,26 @@ pub enum LuksError {
         max_kib: u32,
     },
 
+    /// The header asks to derive a master key longer than the ceiling allows.
+    ///
+    /// A third cost axis, independent of iterations and of Argon2 memory, and
+    /// bounded for the same reason as the memory one: the derived-key length
+    /// multiplies the work of every PBKDF2 iteration (`ceil(dkLen / hLen)` HMAC
+    /// blocks each), and it sizes an allocation. Crucially it also sizes the
+    /// CALIBRATION probe used to project the iteration cost, so leaving it
+    /// unbounded makes the measurement itself the denial of service — the guard
+    /// has to run before anything is measured or allocated.
+    #[error(
+        "header asks to derive a {requested} byte master key, over the {max} \
+         byte ceiling — refusing before allocating or calibrating"
+    )]
+    KeyLengthExceeded {
+        /// The master-key length the header asked for, verbatim, in bytes.
+        requested: usize,
+        /// The ceiling that was exceeded, in bytes.
+        max: usize,
+    },
+
     /// The header is structurally malformed (a field runs past the buffer).
     #[error("malformed LUKS header: {what} (need {need} bytes, have {got})")]
     MalformedHeader {
