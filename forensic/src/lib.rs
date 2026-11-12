@@ -1,5 +1,8 @@
 //! # luks-forensic — LUKS metadata anomaly auditor
 //!
+//! Public items here take or return `luks` types (`Luks1Header` in `audit1`/`audit1_findings`), so `luks-core` is a
+//! public dependency: an incompatible `luks-core` changes this crate's API as well.
+//!
 //! Emits severity-graded [`forensicnomicon::report::Finding`]s over the cipher,
 //! KDF, and keyslot parameters a LUKS header exposes *without* any passphrase.
 //! Findings are observations, never verdicts — the examiner draws conclusions.
