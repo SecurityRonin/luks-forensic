@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/SecurityRonin/luks-forensic/compare/luks-core-v0.1.8...luks-core-v0.2.0) - 2026-11-12
+
+### Fixed
+
+- *(vfs)* [**breaking**] implement forensic-vfs 0.10, the trait the engine links against
+
 ## [0.1.8](https://github.com/SecurityRonin/luks-forensic/compare/luks-core-v0.1.7...luks-core-v0.1.8) - 2026-08-07
 
 ### Fixed
